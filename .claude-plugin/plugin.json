@@ -1,0 +1,13 @@
+{
+  "name": "bypass-safety-harness",
+  "version": "0.1.0",
+  "description": "Safety harness for Claude Code sessions running with bypassPermissions: deny catastrophic shell commands, ask on gray-area and out-of-workdir ops, nudge to run tests before finishing.",
+  "author": {
+    "name": "Jonathan Reyes"
+  },
+  "homepage": "https://github.com/jonnyeclectic/claude-safety-harness",
+  "repository": "https://github.com/jonnyeclectic/claude-safety-harness",
+  "license": "MIT",
+  "keywords": ["hooks", "safety", "guardrails", "bypass-permissions", "security"],
+  "hooks": "./hooks/hooks.json"
+}

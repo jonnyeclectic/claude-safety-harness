@@ -1,0 +1,23 @@
+# Trusted roots for the bypass safety harness.
+#
+# Copy this file to  ~/.claude/harness-trusted-roots.txt  and edit it.
+#
+# Directories listed here are treated as part of your workspace: the harness
+# will NOT prompt for edits or file-mutations that land in them, even though
+# they're outside the current session's working directory. One path or glob
+# per line; blank lines and lines starting with # are ignored.
+#
+# The current session's working directory is ALWAYS trusted automatically, so
+# you only need to list SIBLING checkouts / worktrees / related repos.
+#
+# This relaxes ONLY the out-of-workdir location gate. These still apply,
+# trusted root or not:
+#   deny  -> rm -rf /, dd/mkfs to a device, fork bomb, chmod -R on /
+#   ask   -> sudo, force-push, git reset --hard <sha|HEAD~N>, curl|bash
+#
+# Globs allowed: * ? []    e.g. ~/work-*  matches ~/work-loop, ~/work-tilde
+
+# --- examples (delete and replace with your own) ---
+# ~/myproject
+# ~/myproject-*
+# ~/src/*/worktrees
