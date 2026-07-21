@@ -14,8 +14,13 @@ import os
 
 TRUSTED_FILE = os.path.expanduser("~/.claude/harness-trusted-roots.txt")
 
-# scratch/dev dirs are always fine to touch without a prompt
-_SCRATCH = ("/tmp/", "/private/tmp/", "/var/folders/", "/dev/")
+# scratch dirs are always fine to touch without a prompt. Note /dev is NOT
+# blanket-trusted: only the harmless character devices below (and /dev/fd/*,
+# where realpath sends /dev/stdout etc.) — so a write to a raw disk like
+# /dev/rdisk0 still falls through to the location gate.
+_SCRATCH = ("/tmp/", "/private/tmp/", "/var/folders/", "/dev/fd/")
+_SAFE_DEV = {"/dev/null", "/dev/zero", "/dev/tty", "/dev/stdin",
+             "/dev/stdout", "/dev/stderr", "/dev/random", "/dev/urandom"}
 
 
 def load_trusted_roots():
@@ -52,6 +57,8 @@ def is_trusted(target, cwd):
     target = os.path.realpath(target)
     cwd = os.path.realpath(cwd)
     if target == cwd or target.startswith(cwd + os.sep):
+        return True
+    if target in _SAFE_DEV:
         return True
     if target.startswith(_SCRATCH) or target in ("/tmp", "/private/tmp"):
         return True

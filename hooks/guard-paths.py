@@ -6,6 +6,10 @@ working directory is deferred to manual approval (ask). Edits inside the workdir
 pass silently, preserving bypass speed. This is the file-tool half of the
 "manual approval for interactions outside the working directory" rule; the Bash
 half lives in guard-bash.py.
+
+Why this still matters alongside the OS sandbox: the Claude Code sandbox only
+wraps Bash subprocesses — the built-in Read/Edit/Write tools are NOT sandboxed,
+so this hook is the boundary for those tools even under `claudex`.
 """
 import json
 import os

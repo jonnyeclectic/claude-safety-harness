@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """PreToolUse safety guard for Bash under bypassPermissions.
 
+This is the *advisory* layer. When launched via `claudex`, the OS sandbox
+(Seatbelt/bubblewrap) is the hard wall that kernel-blocks subprocess writes/reads
+outside the project — including tricks this regex parser can't see (python -c,
+sed -i, find -delete). These hooks add fast catastrophic denies, gray-area asks,
+and an out-of-workdir prompt on top, and are the only guard when NOT run via
+claudex. Don't over-invest in the parser; the sandbox is the real boundary.
+
 Decision model (kept deliberately small and auditable):
   deny  -> catastrophic / irreversible. Hard-blocked even under bypass.
   ask   -> gray-area risky ops, and any WRITE/DELETE reaching outside the
@@ -24,7 +31,9 @@ except Exception:  # degrade to cwd-only if the shared helper is missing
     def is_trusted(target, cwd):
         t, c = os.path.realpath(target), os.path.realpath(cwd)
         return (t == c or t.startswith(c + os.sep)
-                or t.startswith(("/tmp/", "/private/tmp/", "/var/folders/", "/dev/")))
+                or t.startswith(("/tmp/", "/private/tmp/", "/var/folders/", "/dev/fd/"))
+                or t in {"/dev/null", "/dev/zero", "/dev/tty", "/dev/stdin",
+                         "/dev/stdout", "/dev/stderr", "/dev/random", "/dev/urandom"})
 
 AUDIT_LOG = os.path.expanduser("~/.claude/harness-audit.log")
 

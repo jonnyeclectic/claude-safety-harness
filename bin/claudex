@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# claudex — launch Claude Code in a sandboxed bypassPermissions ("YOLO") session.
+#
+#   claudex            sandboxed bypass in the current dir; writes limited to the
+#                      project + temp (kernel-enforced); network open.
+#   claudex --strict   same, plus: NO subprocess network egress, secret files
+#                      (~/.ssh, ~/.aws, ...) hidden, secret env vars scrubbed.
+#
+# All other arguments are passed straight through to `claude`.
+#
+# The OS sandbox is the hard wall (Seatbelt on macOS / bubblewrap on Linux); the
+# bundled plugin's PreToolUse hooks add the advisory layer + test nudge on top.
+# Trusted sibling roots from ~/.claude/harness-trusted-roots.txt are made
+# writable in the sandbox and passed as --add-dir.
+set -euo pipefail
+
+HARNESS_DIR="${CLAUDEX_HARNESS_DIR:-$HOME/.claude/harness}"
+TRUSTED_ROOTS="${CLAUDEX_TRUSTED_ROOTS:-$HOME/.claude/harness-trusted-roots.txt}"
+
+# --- parse args: consume --strict, pass the rest through --------------------
+strict=0
+pass_args=()
+for arg in "$@"; do
+  case "$arg" in
+    --strict) strict=1 ;;
+    *)        pass_args+=("$arg") ;;
+  esac
+done
+
+if [ "$strict" -eq 1 ]; then
+  template="$HARNESS_DIR/sandbox.strict.json"
+else
+  template="$HARNESS_DIR/sandbox.base.json"
+fi
+
+compose="$HARNESS_DIR/compose-settings.py"
+for f in "$template" "$compose"; do
+  if [ ! -f "$f" ]; then
+    echo "claudex: missing $f — run ./install.sh first." >&2
+    exit 1
+  fi
+done
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "claudex: 'claude' not found on PATH." >&2
+  exit 1
+fi
+
+# --- compose effective settings + collect trusted roots for --add-dir -------
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/claudex.XXXXXX")"
+cleanup() { rm -rf "$workdir"; }
+trap cleanup EXIT INT TERM
+settings_file="$workdir/settings.json"
+
+add_dirs=()
+roots_arg="$TRUSTED_ROOTS"
+[ -f "$roots_arg" ] || roots_arg="NONE"
+while IFS= read -r d; do
+  [ -n "$d" ] && add_dirs+=(--add-dir "$d")
+done < <(python3 "$compose" "$template" "$roots_arg" "$settings_file")
+
+# --- announce the active profile (to stderr, so -p stdout stays clean) ------
+if [ "$strict" -eq 1 ]; then
+  echo "claudex: STRICT — sandbox on; subprocess network DISABLED; secrets hidden; writes → project+temp." >&2
+else
+  echo "claudex: sandbox on; writes → project+temp (+trusted roots); network open. Use --strict to lock down." >&2
+fi
+
+# Run as a child (not exec) so the temp settings dir is cleaned up on exit.
+claude --dangerously-skip-permissions \
+       --settings "$settings_file" \
+       "${add_dirs[@]}" \
+       "${pass_args[@]}"
