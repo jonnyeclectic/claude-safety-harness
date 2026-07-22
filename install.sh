@@ -61,16 +61,35 @@ case "$(uname -s)" in
   *)      warn "Unrecognized OS $(uname -s); the OS sandbox may be unavailable." ;;
 esac
 
+# Fail fast if ~/.claude isn't writable. The usual cause is running install.sh
+# INSIDE a sandboxed `claudex` session (e.g. via the `!` prefix), where writes to
+# ~/.claude are kernel-denied — otherwise this surfaces much later as a cryptic
+# `cp: Operation not permitted` after the plugin step has already half-run.
+mkdir -p "$CLAUDE_DIR" 2>/dev/null || true
+_probe="$CLAUDE_DIR/.harness-install-probe.$$"
+if ! touch "$_probe" 2>/dev/null; then
+  die "Cannot write to $CLAUDE_DIR — install.sh looks like it is running inside a
+       sandboxed claudex session. Run it from a NORMAL terminal (do not use the
+       '!' prefix inside claudex)."
+fi
+rm -f "$_probe"
+
 # ---------------------------------------------------------------------------
 # 2. Plugin (hooks) at user scope, from this local clone
 # ---------------------------------------------------------------------------
-info "Registering marketplace + installing plugin (user scope)…"
-claude plugin marketplace add "$REPO_DIR" --scope user >/dev/null 2>&1 \
-  || info "marketplace '$MARKETPLACE' already registered (or refreshed)."
+info "Registering marketplace + installing/updating plugin (user scope)…"
+# `add` registers the marketplace on first run; on later runs it no-ops, so we
+# also `update` to re-read the manifest from source. Without that refresh a
+# bumped plugin version is never seen and `install` treats the stale cached
+# version as already satisfied (leaving your hooks out of date).
+claude plugin marketplace add    "$REPO_DIR"   --scope user >/dev/null 2>&1 || true
+claude plugin marketplace update "$MARKETPLACE"             >/dev/null 2>&1 || true
 if claude plugin install "$PLUGIN@$MARKETPLACE" --scope user >/dev/null 2>&1; then
   ok "Plugin '$PLUGIN' installed."
+elif claude plugin update "$PLUGIN" >/dev/null 2>&1; then
+  ok "Plugin '$PLUGIN' updated to the latest version."
 else
-  warn "Plugin install returned nonzero — it may already be installed. Check: claude plugin list"
+  warn "Plugin install/update returned nonzero — check: claude plugin list"
 fi
 
 # ---------------------------------------------------------------------------
