@@ -216,7 +216,7 @@ def redirect_targets(stmt):
                         tok.append(ch)
                 elif ch in ("'", '"'):
                     tq = ch
-                elif ch in " \t\n;|&<>":
+                elif ch in " \t\n;|&<>()`":
                     break
                 else:
                     tok.append(ch)

@@ -1,6 +1,6 @@
 {
   "name": "bypass-safety-harness",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Safety harness for Claude Code bypassPermissions sessions. Pairs the OS sandbox (via the `claudex` launcher) with PreToolUse hooks: deny catastrophic shell commands, ask on gray-area and out-of-workdir ops, nudge to run tests before finishing.",
   "author": {
     "name": "Jonathan Reyes"
