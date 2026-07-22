@@ -22,6 +22,35 @@ _SCRATCH = ("/tmp/", "/private/tmp/", "/var/folders/", "/dev/fd/")
 _SAFE_DEV = {"/dev/null", "/dev/zero", "/dev/tty", "/dev/stdin",
              "/dev/stdout", "/dev/stderr", "/dev/random", "/dev/urandom"}
 
+# First-party Claude Code output locations under ~/.claude that the agent writes
+# to as part of normal operation. These hold benign markdown/scratch, NOT secrets
+# or config, so trust them to avoid an approval prompt every time. Everything else
+# under ~/.claude (.credentials.json, settings.json, this harness, the audit log,
+# and the session transcripts under projects/<slug>/) stays gated. is_trusted()
+# realpath-normalizes the target first, so traversals like
+# ~/.claude/plans/../settings.json resolve out of these prefixes and are NOT
+# trusted.
+#   - ~/.claude/plans/               plan-mode plan files
+#   - ~/.claude/projects/*/memory/   per-project auto-memory files
+_CLAUDE_OUTPUT_DIRS = tuple(
+    os.path.realpath(os.path.expanduser(p)) + os.sep
+    for p in ("~/.claude/plans",)
+)
+_CLAUDE_PROJECTS = os.path.realpath(os.path.expanduser("~/.claude/projects"))
+
+
+def _is_claude_output(target):
+    """True if realpath `target` is inside a first-party Claude Code output dir:
+    ~/.claude/plans/... or ~/.claude/projects/<slug>/memory/... . Scoped to the
+    memory/ subdir so session transcripts (projects/<slug>/*.jsonl) stay gated."""
+    if target.startswith(_CLAUDE_OUTPUT_DIRS):
+        return True
+    if target.startswith(_CLAUDE_PROJECTS + os.sep):
+        # rest = ["<slug>", "memory", ...]; exactly one slug segment, then memory/
+        rest = target[len(_CLAUDE_PROJECTS) + 1:].split(os.sep)
+        return len(rest) >= 2 and rest[1] == "memory"
+    return False
+
 
 def load_trusted_roots():
     """Return the raw (unexpanded) trusted-root lines, sans comments/blanks."""
@@ -59,6 +88,8 @@ def is_trusted(target, cwd):
     if target == cwd or target.startswith(cwd + os.sep):
         return True
     if target in _SAFE_DEV:
+        return True
+    if _is_claude_output(target):
         return True
     if target.startswith(_SCRATCH) or target in ("/tmp", "/private/tmp"):
         return True

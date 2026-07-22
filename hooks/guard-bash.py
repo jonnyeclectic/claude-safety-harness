@@ -159,25 +159,98 @@ def outside_cwd(pathtok):
     return tgt
 
 
-# file-creating redirects (> / >>) to a path outside CWD, for ANY command
-for rt in re.findall(r">>?\s*([^\s;|&]+)", CMD):
-    if rt.startswith(("&",)) or rt in ("/dev/null",):
-        continue
-    tgt = outside_cwd(rt)
-    if tgt:
-        emit("ask",
-             f"Harness: redirect writes outside the working directory "
-             f"({rt} -> {tgt}); approve manually. Command: {CMD}")
+def split_statements(cmd):
+    """Split a command line into top-level statements, respecting quotes, so each
+    simple command is inspected on its own. Splits on ; newline | & (which also
+    breaks && and ||). Quote-aware: a `python -c "...; a && b..."` blob stays one
+    statement, so its contents are never mistaken for separators or for the outer
+    command's arguments. This is what stops `.venv/bin/python` in a later
+    statement from being read as an `rm` target of an earlier `rm -rf scratch`
+    statement, and it also lets a mutator that is NOT the first word of the line
+    (e.g. `cd /x && rm -rf /outside`) still be checked."""
+    stmts, buf, quote = [], [], None
+    for c in cmd:
+        if quote:
+            buf.append(c)
+            if c == quote:
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+            buf.append(c)
+        elif c in ";\n|&":
+            stmts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+    stmts.append("".join(buf))
+    return [s.strip() for s in stmts if s.strip()]
 
-# mutating command whose target path is outside CWD
-try:
-    tokens = shlex.split(CMD)
-except ValueError:
-    tokens = CMD.split()
-cmd_word = os.path.basename(tokens[0]) if tokens else ""
-if cmd_word in MUTATORS:
+
+def redirect_targets(stmt):
+    """Yield the target of each real (unquoted) > or >> operator in `stmt`. A '>'
+    inside quotes (e.g. the '=>' in a `python -c` code blob) is data, not a
+    redirect operator, so it is ignored."""
+    out, i, n, quote = [], 0, len(stmt), None
+    while i < n:
+        c = stmt[i]
+        if quote:
+            if c == quote:
+                quote = None
+            i += 1
+        elif c in ("'", '"'):
+            quote = c
+            i += 1
+        elif c == ">":
+            i += 1
+            if i < n and stmt[i] == ">":
+                i += 1
+            while i < n and stmt[i] in " \t":
+                i += 1
+            tok, tq = [], None
+            while i < n:
+                ch = stmt[i]
+                if tq:
+                    if ch == tq:
+                        tq = None
+                    else:
+                        tok.append(ch)
+                elif ch in ("'", '"'):
+                    tq = ch
+                elif ch in " \t\n;|&<>":
+                    break
+                else:
+                    tok.append(ch)
+                i += 1
+            if tok:
+                out.append("".join(tok))
+        else:
+            i += 1
+    return out
+
+
+for stmt in split_statements(CMD):
+    # file-creating redirects (> / >>) whose target is outside CWD
+    for rt in redirect_targets(stmt):
+        if rt.startswith("&") or rt == "/dev/null":
+            continue
+        tgt = outside_cwd(rt)
+        if tgt:
+            emit("ask",
+                 f"Harness: redirect writes outside the working directory "
+                 f"({rt} -> {tgt}); approve manually. Command: {CMD}")
+
+    # mutating command whose OWN target path is outside CWD
+    try:
+        tokens = shlex.split(stmt)
+    except ValueError:
+        tokens = stmt.split()
+    if not tokens:
+        continue
+    cmd_word = os.path.basename(tokens[0])
+    if cmd_word not in MUTATORS:
+        continue
     for tok in tokens[1:]:
-        if tok.startswith("-") or "/" not in tok and not tok.startswith(("~", "$")):
+        if tok.startswith("-") or ("/" not in tok and not tok.startswith(("~", "$"))):
             continue
         tgt = outside_cwd(tok)
         if tgt:
