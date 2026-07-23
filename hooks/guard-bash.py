@@ -438,13 +438,67 @@ for _stmt in STATEMENTS:
         if _target != "-":  # `cd -` (previous dir): not tracked, don't guess
             _eff_cwd = resolve_path(_target, ASSIGNS, _eff_cwd)
 
+# Branches whose force-push is a real, everyone-affecting history overwrite.
+# Force-pushing any OTHER explicit branch is the routine amend->force-push
+# topic/PR-branch idiom and is allowed.
+_PROTECTED_BRANCHES = {"main", "master", "develop", "trunk"}
+
+
+def force_push_asks(stmt):
+    """True if `stmt` is a `git push` FORCE that should ASK. A force-push whose
+    every destination ref is an explicit non-protected branch (updating your own
+    topic/PR branch) is allowed; a force-push to a default/shared branch
+    (main/master/...), an --all/--mirror push, or a force-push with no explicit
+    branch (target unknown -> could be the default branch) still asks -- that is
+    where an irreversible shared-history overwrite lives. Tokens are shlex-split,
+    so a `git push --force ...` mentioned inside a QUOTED commit message is one
+    token, not a command, and never trips this."""
+    try:
+        toks = shlex.split(stmt, posix=False)
+    except ValueError:
+        return False
+    low_toks = [t.lower() for t in toks]
+    if "push" not in low_toks:
+        return False
+    pi = low_toks.index("push")
+    if pi == 0 or os.path.basename(low_toks[pi - 1]) != "git":
+        return False
+    after = toks[pi + 1:]
+
+    def _is_force_flag(t):
+        return (t in ("--force", "--force-with-lease")
+                or t.startswith("--force-with-lease=")
+                or (t.startswith("-") and not t.startswith("--")
+                    and "f" in t[1:].lower()))
+
+    forced = (any(_is_force_flag(t) for t in after)
+              or any(t.startswith("+") and len(t) > 1 for t in after))
+    if not forced:
+        return False
+    if any(t.lower() in ("--all", "--mirror") for t in after):
+        return True  # pushes many/all refs -> ask
+    # positional args after `push` are [remote, refspec...]; drop flags and any
+    # redirect/control token (`2>&1`, `>log`) so only real refspecs remain.
+    positional = [t for t in after
+                  if not t.startswith("-") and not any(c in t for c in "<>&")]
+    refspecs = positional[1:]  # first positional is the remote (name or URL)
+    if not refspecs:
+        return True  # no explicit branch -> target unknown -> ask
+    for spec in refspecs:
+        dst = spec.split(":")[-1].lstrip("+")   # `src:dst`/`+dst` -> dst
+        if dst.lower().startswith("refs/heads/"):
+            dst = dst[len("refs/heads/"):]
+        dst = dst.lower()
+        if not dst or "*" in dst or dst in _PROTECTED_BRANCHES:
+            return True  # protected / glob / empty (deletion) -> ask
+    return False  # every destination is an explicit non-protected branch
+
+
 # ---- 2. ASK: gray-area risky (reversible-but-dangerous) ---------------------
 # GLOBAL: blast radius reaches beyond the directory the command runs in (a
 # real remote, elevated privileges, arbitrary code exec) -- ask regardless of
 # location, scratch clone or not.
 GRAY_RULES_GLOBAL = [
-    (r"\bgit\s+push\b[^\n]*(--force\b|--force-with-lease\b|\s-\w*f|\s\+\S)",
-     "force-push can overwrite remote history."),
     (r"\bsudo\b",
      "sudo runs with elevated privileges."),
     (r"(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|k)?sh\b",
@@ -453,6 +507,19 @@ GRAY_RULES_GLOBAL = [
 for pat, why in GRAY_RULES_GLOBAL:
     if re.search(pat, low):
         emit("ask", f"Harness: gray-area op needs your OK — {why} Command: {CMD}")
+
+# force-push: ask only where a real shared-history overwrite can happen -- a
+# default/protected branch, an --all/--mirror push, or a push with no explicit
+# branch (target unknown). A force-push to an explicit non-protected branch (the
+# routine amend->force-push topic/PR-branch idiom) is allowed. Per-STATEMENT so
+# `cd /x && git push -f ...` is still seen; location-independent (a real remote
+# is reached from any cwd, scratch clone or not).
+for _stmt in STATEMENTS:
+    if force_push_asks(_stmt):
+        emit("ask",
+             "Harness: gray-area op needs your OK — force-push to a default/"
+             f"shared branch or all refs can overwrite remote history. "
+             f"Command: {CMD}")
 
 # LOCAL: git history-rewrite ops whose blast radius is confined to the repo
 # they run in. Skip the prompt when that repo's effective directory is
