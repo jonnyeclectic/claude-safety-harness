@@ -121,6 +121,47 @@ class TestCatastrophicDeny(HookCase):
         self.assertBash("rm -rf ~", "deny", cwd=SCRATCH_CWD)
 
 
+class TestDenyInsideSubstitution(HookCase):
+    """A catastrophic command run via command substitution or a subshell is
+    executed even inside double quotes, so it must still be DENIED. code_only()
+    keeps the `$(...)`/backtick spans, and the whole-filesystem DENY rules
+    terminate their target on `)` / backtick (shared _END), so the target is
+    recognized. Single-quoted text and a mere deep path are NOT over-denied."""
+
+    # Built at runtime so this file's source carries no runnable literal.
+    RMRF = "r" + "m -rf /"
+
+    def test_double_quoted_command_substitution_denied(self):
+        self.assertBash('echo "$(%s)"' % self.RMRF, "deny")
+
+    def test_unquoted_command_substitution_denied(self):
+        self.assertBash("echo $(%s)" % self.RMRF, "deny")
+
+    def test_backtick_substitution_denied(self):
+        self.assertBash("echo `%s`" % self.RMRF, "deny")
+
+    def test_assignment_substitution_denied_even_in_scratch(self):
+        self.assertBash('x="$(%s)"' % self.RMRF, "deny", cwd=SCRATCH_CWD)
+
+    def test_subshell_denied(self):
+        self.assertBash("(cd /tmp && %s)" % self.RMRF, "deny")
+
+    def test_chmod_root_in_substitution_denied(self):
+        # The shared _END boundary covers the chmod/chown whole-fs rules too.
+        self.assertBash('echo "$(chmod -R 777 /)"', "deny")
+
+    # --- must NOT over-deny -------------------------------------------------
+
+    def test_single_quoted_is_literal_allowed(self):
+        # Single quotes suppress substitution: printed verbatim, never run.
+        self.assertBash("echo '$(%s)'" % self.RMRF, "allow")
+
+    def test_deep_path_in_substitution_not_denied(self):
+        # A specific deep path is not the whole tree, so it is not a
+        # catastrophic deny (echo is not a mutator -> no out-of-cwd ask either).
+        self.assertBash('echo "$(%shome/u/proj/build)"' % self.RMRF, "allow")
+
+
 class TestGrayGlobalAsk(HookCase):
     """Ops whose blast radius leaves the local dir ask EVERYWHERE — even in a
     throwaway scratch clone. A disposable cwd doesn't make these safe."""
