@@ -296,11 +296,18 @@ def code_only(cmd):
 low = code_only(CMD).lower()
 
 # ---- 1. DENY: catastrophic / irreversible -----------------------------------
+# Trailing boundary for a whole-filesystem target. Beyond the usual whitespace /
+# statement separators, `)` and backtick count as boundaries too: code_only()
+# KEEPS command-substitution spans (they execute even in data position), so a
+# target inside `"$(...)"` or `` "`...`" `` reaches the scanner as e.g.
+# `rm -rf /)` -- without `)`/backtick here the trailing char would stop the
+# target rule from matching and a real wipe/format would slip through.
+_END = r"(?:\s|[;&|)`]|$)"
 DENY_RULES = [
     # rm -rf whose target is the WHOLE tree: root, home, or a top-level wildcard.
     # A specific deep path outside cwd is NOT denied here -> it falls through to
     # the out-of-workdir "ask" gate below.
-    (r"\brm\b(?=.*\s-[a-z]*[rf])[^\n]*?\s(/|~|~/|\$home|\$home/)\*?(\s|;|&|\||$)",
+    (r"\brm\b(?=.*\s-[a-z]*[rf])[^\n]*?\s(/|~|~/|\$home|\$home/)\*?" + _END,
      "rm -rf targeting / ~ $HOME or a filesystem wildcard is irreversible."),
     (r"--no-preserve-root",
      "--no-preserve-root removes the last guard against wiping /."),
@@ -317,9 +324,9 @@ DENY_RULES = [
     (r"\b(shred|wipefs)\b[^\n]*/dev/",
      "shred/wipefs on a device is irreversible."),
     # recursive chmod/chown of the whole filesystem
-    (r"\bchmod\b[^\n]*-[a-z]*r[a-z]*\s+[0-7]{3,4}\s+/(\s|$)",
+    (r"\bchmod\b[^\n]*-[a-z]*r[a-z]*\s+[0-7]{3,4}\s+/" + _END,
      "Recursive chmod on / breaks the system."),
-    (r"\bchown\b[^\n]*-[a-z]*r[a-z]*\s+\S+\s+/(\s|$)",
+    (r"\bchown\b[^\n]*-[a-z]*r[a-z]*\s+\S+\s+/" + _END,
      "Recursive chown on / breaks the system."),
 ]
 for pat, why in DENY_RULES:
