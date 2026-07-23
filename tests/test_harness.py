@@ -240,11 +240,35 @@ class TestScanSkipsData(HookCase):
         self.assertBash('git commit -m "explain the git rebase we did"', "allow",
                         cwd=REAL_CWD)
 
+    def test_single_quoted_substitution_is_literal_allowed(self):
+        # Single quotes suppress ALL expansion: `'$(mkfs)'` is printed verbatim,
+        # never executed, so it is genuinely data and passes.
+        self.assertBash("echo '$(%s)'" % self.MKFS, "allow")
+
     # --- code that MUST still trigger (no hole opened) ----------------------
 
     def test_interpreter_heredoc_body_still_denied(self):
         # bash executes its heredoc, so a destructive body is real and denied.
         cmd = "bash <<'EOF'\n%s\nEOF" % self.RMRF
+        self.assertBash(cmd, "deny", cwd=SCRATCH_CWD)
+
+    def test_double_quoted_command_substitution_still_denied(self):
+        # Double quotes suppress word-splitting, NOT command substitution:
+        # `"$(mkfs)"` runs mkfs, so the payload must still be scanned.
+        self.assertBash('echo "$(%s)"' % self.MKFS, "deny")
+
+    def test_assignment_command_substitution_still_denied(self):
+        # `x="$(mkfs)"` executes the substitution too.
+        self.assertBash('x="$(%s)"' % self.MKFS, "deny", cwd=SCRATCH_CWD)
+
+    def test_backtick_substitution_in_double_quotes_still_denied(self):
+        self.assertBash('echo "`%s`"' % self.MKFS, "deny")
+
+    def test_unquoted_heredoc_command_substitution_still_denied(self):
+        # An UNQUOTED heredoc delimiter still expands `$(...)` in the body, so a
+        # substitution there is executed and must be caught (a QUOTED <<'EOF'
+        # body is literal — see test_cat_heredoc_scary_body_allowed).
+        cmd = "cat <<EOF\n$(%s)\nEOF" % self.MKFS
         self.assertBash(cmd, "deny", cwd=SCRATCH_CWD)
 
     def test_bare_destructive_command_still_denied(self):

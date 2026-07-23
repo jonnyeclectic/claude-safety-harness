@@ -86,13 +86,16 @@ if not CMD:
 
 # ---- scan text: match DENY/GRAY patterns against CODE, not DATA --------------
 # The rules below pattern-match the command string. A heredoc body
-# (`git commit -F - <<'EOF' ... EOF`, `cat <<EOF ... EOF`) and a quoted argument
-# (`git commit -m "..."`, `echo "..."`) are DATA handed to a command, not shell
-# the shell executes -- yet a naive scan flags dangerous-looking WORDS inside
-# them (a commit message that says "rm -rf /" is not a delete). code_only()
-# blanks that data before matching but KEEPS anything an interpreter actually
-# runs (`bash -c "..."`, `python <<EOF`, `eval "..."`), so a real payload is
-# still caught. It errs toward KEEPING text on any doubt: the worst case is an
+# (`git commit -F - <<'EOF' ... EOF`, `cat <<'EOF' ... EOF`) and a quoted
+# argument (`git commit -m "..."`, `echo "..."`) are DATA handed to a command,
+# not shell the shell executes -- yet a naive scan flags dangerous-looking WORDS
+# inside them (a commit message that says "rm -rf /" is not a delete).
+# code_only() blanks that literal data before matching but KEEPS anything that
+# is still executed: an interpreter's arg/stdin (`bash -c "..."`, `python
+# <<EOF`, `eval "..."`) AND command substitutions, which run even in data
+# position -- `"$(cmd)"`, `` "`cmd`" ``, and `$(...)` in an unquoted heredoc
+# body. Single-quoted data and quoted-delimiter heredocs are truly literal and
+# stay blanked. It errs toward KEEPING text on any doubt: the worst case is an
 # over-broad match (a spurious ask), never a missed catastrophic command. Path
 # logic (sections' cd-tracking / out-of-cwd checks) still works on the raw
 # command via _strip_heredocs so real targets are never blanked.
@@ -145,11 +148,58 @@ def _has_interp(text):
     return any(os.path.basename(t) in _INTERP for t in toks)
 
 
+def _keep_substitutions(data):
+    """Blank the LITERAL characters of a data string but PRESERVE command-
+    substitution spans -- `$(...)` (paren-nested) and `` `...` `` -- because the
+    shell still EXECUTES those even when the surrounding text is data: inside
+    double quotes (`"...$(cmd)..."`) and inside an UNQUOTED heredoc body. Only
+    single-quoted data and QUOTED-delimiter heredoc bodies are truly literal,
+    and those never reach here. Whitespace/newlines are kept so statement and
+    line boundaries survive for the scanners; every other literal char is
+    dropped so a scary WORD that is merely data does not match."""
+    out, i, n = [], 0, len(data)
+    while i < n:
+        c = data[i]
+        if c == "$" and i + 1 < n and data[i + 1] == "(":
+            out.append("$(")
+            i += 2
+            depth = 1
+            while i < n and depth:
+                ch = data[i]
+                out.append(ch)
+                i += 1
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+        elif c == "`":
+            out.append(c)
+            i += 1
+            while i < n and data[i] != "`":
+                out.append(data[i])
+                i += 1
+            if i < n:
+                out.append("`")  # closing backtick
+                i += 1
+        elif c in " \t\n":
+            out.append(c)  # keep structural whitespace
+            i += 1
+        else:
+            i += 1  # blank a literal data character
+    return "".join(out)
+
+
 def _strip_heredocs(cmd):
-    """Drop heredoc BODIES from `cmd`, keeping each opener and closing-delimiter
-    line. A body is stdin data (`cat <<EOF ... EOF`) unless the opener runs an
-    interpreter that executes stdin (`bash <<EOF ... EOF`), in which case it is
-    kept and still scanned."""
+    """Reduce heredoc BODIES to the CODE the shell runs, keeping each opener and
+    closing-delimiter line. Three cases by receiver/delimiter:
+      - opener runs an interpreter (`bash <<EOF ... EOF`): the whole body is
+        executed -> kept and still scanned;
+      - non-interpreter, QUOTED delimiter (`cat <<'EOF' ... EOF`): the body is
+        fully literal stdin data -> dropped;
+      - non-interpreter, UNQUOTED delimiter (`cat <<EOF ... EOF`): the body is
+        stdin data BUT still undergoes command substitution -> only its
+        `$(...)`/backtick spans are kept (via _keep_substitutions), so a real
+        payload is caught while literal scary words are dropped."""
     opener = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
     lines, out, i = cmd.split("\n"), [], 0
     while i < len(lines):
@@ -157,11 +207,15 @@ def _strip_heredocs(cmd):
         out.append(line)
         m = opener.search(line)
         if m:
-            delim, keep = m.group(2), _has_interp(line)
+            delim = m.group(2)
+            keep_all = _has_interp(line)          # interpreter executes the body
+            subst_only = not keep_all and not m.group(1)  # unquoted non-interp
             i += 1
             while i < len(lines) and lines[i].strip() != delim:
-                if keep:
+                if keep_all:
                     out.append(lines[i])
+                elif subst_only:
+                    out.append(_keep_substitutions(lines[i]))
                 i += 1
             if i < len(lines):
                 out.append(lines[i])  # the closing delimiter line itself
@@ -171,16 +225,27 @@ def _strip_heredocs(cmd):
 
 def code_only(cmd):
     """`cmd` reduced to the text the shell executes as CODE: heredoc bodies and
-    quoted-argument contents removed, EXCEPT where an interpreter runs them.
+    quoted-argument contents removed, EXCEPT where they are still executed.
     Structural characters (separators, pipes, redirects, quote marks) are kept,
     so e.g. the `|` in `curl x | sh` survives for the pipe-into-shell rule.
+
+    Three quote contexts:
+      - interpreter arg (`bash -c "..."`, `eval "..."`): the whole quoted string
+        is executed -> kept;
+      - single-quoted data (`'...'`): the shell suppresses ALL expansion ->
+        fully literal -> blanked;
+      - double-quoted data (`"..."`): word-splitting is suppressed but command
+        substitution is NOT -- `"$(cmd)"` and `` "`cmd`" `` still run -> the
+        literal text is blanked but the `$(...)`/backtick spans are KEPT
+        (via _keep_substitutions), so a real payload is still caught.
 
     Single pass: the interpreter word of a statement precedes its quoted arg, so
     tracking the words seen so far in the current statement is enough to know,
     at the moment a quote opens, whether its contents are code (keep) or data
-    (blank)."""
+    (blank/substitution-only)."""
     text = _strip_heredocs(cmd)
     out, word, quote, interp = [], [], None, False
+    dq = []  # buffer of double-quoted DATA awaiting substitution-aware blanking
 
     def flush_word():
         nonlocal interp
@@ -191,14 +256,23 @@ def code_only(cmd):
 
     for c in text:
         if quote:
-            if interp:
+            if interp:                # interpreter runs the whole quoted arg
                 out.append(c)
                 if c == quote:
                     quote = None
-            elif c == quote:      # data: keep only the closing quote mark
-                quote = None
-                out.append(c)
-            # else: blank the quoted data character
+            elif quote == "'":        # single quotes: fully literal data
+                if c == quote:
+                    quote = None
+                    out.append(c)     # keep the closing quote mark
+                # else: blank the quoted data character
+            else:                     # double quotes: data, but $()/`` execute
+                if c == quote:
+                    out.append(_keep_substitutions("".join(dq)))
+                    del dq[:]
+                    quote = None
+                    out.append(c)     # keep the closing quote mark
+                else:
+                    dq.append(c)
             continue
         if c in ("'", '"'):
             flush_word()
@@ -214,6 +288,8 @@ def code_only(cmd):
         else:
             word.append(c)
             out.append(c)
+    if dq:  # unterminated double quote -> err toward keeping (scan what's there)
+        out.append(_keep_substitutions("".join(dq)))
     return "".join(out)
 
 
