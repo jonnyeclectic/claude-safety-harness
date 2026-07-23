@@ -84,7 +84,216 @@ CWD = DATA.get("cwd") or os.getcwd()
 if not CMD:
     sys.exit(0)
 
-low = CMD.lower()
+# ---- scan text: match DENY/GRAY patterns against CODE, not DATA --------------
+# The rules below pattern-match the command string. A heredoc body
+# (`git commit -F - <<'EOF' ... EOF`, `cat <<'EOF' ... EOF`) and a quoted
+# argument (`git commit -m "..."`, `echo "..."`) are DATA handed to a command,
+# not shell the shell executes -- yet a naive scan flags dangerous-looking WORDS
+# inside them (a commit message that says "rm -rf /" is not a delete).
+# code_only() blanks that literal data before matching but KEEPS anything that
+# is still executed: an interpreter's arg/stdin (`bash -c "..."`, `python
+# <<EOF`, `eval "..."`) AND command substitutions, which run even in data
+# position -- `"$(cmd)"`, `` "`cmd`" ``, and `$(...)` in an unquoted heredoc
+# body. Single-quoted data and quoted-delimiter heredocs are truly literal and
+# stay blanked. It errs toward KEEPING text on any doubt: the worst case is an
+# over-broad match (a spurious ask), never a missed catastrophic command. Path
+# logic (sections' cd-tracking / out-of-cwd checks) still works on the raw
+# command via _strip_heredocs so real targets are never blanked.
+
+# Commands that execute a string arg or their stdin as code. If one appears as
+# a bare word in a statement, that statement's quotes/heredoc are CODE and stay
+# in the scan; otherwise they are data and get blanked.
+_INTERP = {"sh", "bash", "zsh", "ksh", "dash", "ash", "csh", "tcsh", "fish",
+           "python", "python2", "python3", "perl", "ruby", "node", "eval",
+           "source"}
+
+
+def split_statements(cmd):
+    """Split a command line into top-level statements, respecting quotes, so each
+    simple command is inspected on its own. Splits on ; newline | & (which also
+    breaks && and ||). Quote-aware: a `python -c "...; a && b..."` blob stays one
+    statement, so its contents are never mistaken for separators or for the outer
+    command's arguments. This is what stops `.venv/bin/python` in a later
+    statement from being read as an `rm` target of an earlier `rm -rf scratch`
+    statement, and it also lets a mutator that is NOT the first word of the line
+    (e.g. `cd /x && rm -rf /outside`) still be checked."""
+    stmts, buf, quote = [], [], None
+    for c in cmd:
+        if quote:
+            buf.append(c)
+            if c == quote:
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+            buf.append(c)
+        elif c in ";\n|&":
+            stmts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+    stmts.append("".join(buf))
+    return [s.strip() for s in stmts if s.strip()]
+
+
+def _has_interp(text):
+    """True if `text` invokes a shell/interpreter as a bare word -- meaning its
+    quoted args / heredoc body are executed and must stay in the scan. Tokens
+    are split BEFORE the membership test, so an interpreter name that only
+    appears INSIDE a quoted string (the word "bash" in a commit message) is one
+    token and does not count."""
+    try:
+        toks = shlex.split(text, posix=False)
+    except ValueError:
+        toks = text.split()
+    return any(os.path.basename(t) in _INTERP for t in toks)
+
+
+def _keep_substitutions(data):
+    """Blank the LITERAL characters of a data string but PRESERVE command-
+    substitution spans -- `$(...)` (paren-nested) and `` `...` `` -- because the
+    shell still EXECUTES those even when the surrounding text is data: inside
+    double quotes (`"...$(cmd)..."`) and inside an UNQUOTED heredoc body. Only
+    single-quoted data and QUOTED-delimiter heredoc bodies are truly literal,
+    and those never reach here. Whitespace/newlines are kept so statement and
+    line boundaries survive for the scanners; every other literal char is
+    dropped so a scary WORD that is merely data does not match."""
+    out, i, n = [], 0, len(data)
+    while i < n:
+        c = data[i]
+        if c == "$" and i + 1 < n and data[i + 1] == "(":
+            out.append("$(")
+            i += 2
+            depth = 1
+            while i < n and depth:
+                ch = data[i]
+                out.append(ch)
+                i += 1
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+        elif c == "`":
+            out.append(c)
+            i += 1
+            while i < n and data[i] != "`":
+                out.append(data[i])
+                i += 1
+            if i < n:
+                out.append("`")  # closing backtick
+                i += 1
+        elif c in " \t\n":
+            out.append(c)  # keep structural whitespace
+            i += 1
+        else:
+            i += 1  # blank a literal data character
+    return "".join(out)
+
+
+def _strip_heredocs(cmd):
+    """Reduce heredoc BODIES to the CODE the shell runs, keeping each opener and
+    closing-delimiter line. Three cases by receiver/delimiter:
+      - opener runs an interpreter (`bash <<EOF ... EOF`): the whole body is
+        executed -> kept and still scanned;
+      - non-interpreter, QUOTED delimiter (`cat <<'EOF' ... EOF`): the body is
+        fully literal stdin data -> dropped;
+      - non-interpreter, UNQUOTED delimiter (`cat <<EOF ... EOF`): the body is
+        stdin data BUT still undergoes command substitution -> only its
+        `$(...)`/backtick spans are kept (via _keep_substitutions), so a real
+        payload is caught while literal scary words are dropped."""
+    opener = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+    lines, out, i = cmd.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        m = opener.search(line)
+        if m:
+            delim = m.group(2)
+            keep_all = _has_interp(line)          # interpreter executes the body
+            subst_only = not keep_all and not m.group(1)  # unquoted non-interp
+            i += 1
+            while i < len(lines) and lines[i].strip() != delim:
+                if keep_all:
+                    out.append(lines[i])
+                elif subst_only:
+                    out.append(_keep_substitutions(lines[i]))
+                i += 1
+            if i < len(lines):
+                out.append(lines[i])  # the closing delimiter line itself
+        i += 1
+    return "\n".join(out)
+
+
+def code_only(cmd):
+    """`cmd` reduced to the text the shell executes as CODE: heredoc bodies and
+    quoted-argument contents removed, EXCEPT where they are still executed.
+    Structural characters (separators, pipes, redirects, quote marks) are kept,
+    so e.g. the `|` in `curl x | sh` survives for the pipe-into-shell rule.
+
+    Three quote contexts:
+      - interpreter arg (`bash -c "..."`, `eval "..."`): the whole quoted string
+        is executed -> kept;
+      - single-quoted data (`'...'`): the shell suppresses ALL expansion ->
+        fully literal -> blanked;
+      - double-quoted data (`"..."`): word-splitting is suppressed but command
+        substitution is NOT -- `"$(cmd)"` and `` "`cmd`" `` still run -> the
+        literal text is blanked but the `$(...)`/backtick spans are KEPT
+        (via _keep_substitutions), so a real payload is still caught.
+
+    Single pass: the interpreter word of a statement precedes its quoted arg, so
+    tracking the words seen so far in the current statement is enough to know,
+    at the moment a quote opens, whether its contents are code (keep) or data
+    (blank/substitution-only)."""
+    text = _strip_heredocs(cmd)
+    out, word, quote, interp = [], [], None, False
+    dq = []  # buffer of double-quoted DATA awaiting substitution-aware blanking
+
+    def flush_word():
+        nonlocal interp
+        if word:
+            if os.path.basename("".join(word)) in _INTERP:
+                interp = True
+            del word[:]
+
+    for c in text:
+        if quote:
+            if interp:                # interpreter runs the whole quoted arg
+                out.append(c)
+                if c == quote:
+                    quote = None
+            elif quote == "'":        # single quotes: fully literal data
+                if c == quote:
+                    quote = None
+                    out.append(c)     # keep the closing quote mark
+                # else: blank the quoted data character
+            else:                     # double quotes: data, but $()/`` execute
+                if c == quote:
+                    out.append(_keep_substitutions("".join(dq)))
+                    del dq[:]
+                    quote = None
+                    out.append(c)     # keep the closing quote mark
+                else:
+                    dq.append(c)
+            continue
+        if c in ("'", '"'):
+            flush_word()
+            quote = c
+            out.append(c)         # keep the opening quote mark
+        elif c in ";\n|&":
+            flush_word()
+            interp = False        # new statement -> reset interpreter context
+            out.append(c)
+        elif c in " \t":
+            flush_word()
+            out.append(c)
+        else:
+            word.append(c)
+            out.append(c)
+    if dq:  # unterminated double quote -> err toward keeping (scan what's there)
+        out.append(_keep_substitutions("".join(dq)))
+    return "".join(out)
+
+
+low = code_only(CMD).lower()
 
 # ---- 1. DENY: catastrophic / irreversible -----------------------------------
 DENY_RULES = [
@@ -178,33 +387,6 @@ def record_assignments(stmt, assigns):
         assigns[m.group(1)] = expand_vars(_unquote(m.group(2)), assigns)
 
 
-def split_statements(cmd):
-    """Split a command line into top-level statements, respecting quotes, so each
-    simple command is inspected on its own. Splits on ; newline | & (which also
-    breaks && and ||). Quote-aware: a `python -c "...; a && b..."` blob stays one
-    statement, so its contents are never mistaken for separators or for the outer
-    command's arguments. This is what stops `.venv/bin/python` in a later
-    statement from being read as an `rm` target of an earlier `rm -rf scratch`
-    statement, and it also lets a mutator that is NOT the first word of the line
-    (e.g. `cd /x && rm -rf /outside`) still be checked."""
-    stmts, buf, quote = [], [], None
-    for c in cmd:
-        if quote:
-            buf.append(c)
-            if c == quote:
-                quote = None
-        elif c in ("'", '"'):
-            quote = c
-            buf.append(c)
-        elif c in ";\n|&":
-            stmts.append("".join(buf))
-            buf = []
-        else:
-            buf.append(c)
-    stmts.append("".join(buf))
-    return [s.strip() for s in stmts if s.strip()]
-
-
 def resolve_path(pathtok, assigns, base):
     """Expand $VAR/~ (against `assigns`, i.e. this command line's own
     export/assignments, falling back to the hook's own env) and resolve a
@@ -230,7 +412,11 @@ def outside_cwd(pathtok, base):
     return tgt
 
 
-STATEMENTS = split_statements(CMD)
+# Heredoc bodies are stripped first: for a non-interpreter receiver they are
+# stdin data, not executed, so a `mkdir /outside` or `cd /elsewhere` inside one
+# must not drive the cd-tracking or out-of-cwd checks. A `bash <<EOF` body IS
+# kept (see _strip_heredocs) and so is still walked.
+STATEMENTS = split_statements(_strip_heredocs(CMD))
 STMT_CWDS = []  # effective cwd in scope at each statement, same order
 _eff_cwd = os.path.realpath(CWD)
 for _stmt in STATEMENTS:
@@ -275,15 +461,19 @@ GRAY_RULES_LOCAL = [
      "git reset --hard to that target can discard commits/uncommitted work."),
     (r"\bgit\s+clean\s+-[a-z]*f",
      "git clean -f deletes untracked files."),
-    (r"\bgit\s+commit\b[^\n]*(--no-verify|\s-\w*n)",
-     "--no-verify skips the pre-commit gates."),
     (r"\bgit\s+(filter-branch|filter-repo)\b",
      "history rewrite."),
     (r"\bgit\s+rebase\b",
      "rebase rewrites commits."),
 ]
+# NB: `git commit --no-verify` / `-n` is deliberately NOT gated. Every rule
+# above can destroy committed or uncommitted WORK; --no-verify destroys nothing
+# and touches nothing outside the repo -- it only skips optional pre-commit
+# hooks, a code-quality concern, not the catastrophic/outward-facing threat this
+# advisory layer exists for. Gating it just stalled routine automated commits
+# (agent loops use it constantly) with no safety return.
 for _stmt, _stmt_cwd in zip(STATEMENTS, STMT_CWDS):
-    _low_stmt = _stmt.lower()
+    _low_stmt = code_only(_stmt).lower()  # don't match a git verb inside a message
     for pat, why in GRAY_RULES_LOCAL:
         if re.search(pat, _low_stmt) and not is_scratch_root(_stmt_cwd):
             emit("ask",
