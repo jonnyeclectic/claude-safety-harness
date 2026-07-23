@@ -21,19 +21,27 @@ rules can be tuned from real usage.
 import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from harness_common import is_trusted
+    from harness_common import is_trusted, is_scratch_root
 except Exception:  # degrade to cwd-only if the shared helper is missing
+    _SCRATCH_PREFIX = ("/tmp/", "/private/tmp/", "/var/folders/",
+                        "/private/var/folders/", "/dev/fd/")
+
     def is_trusted(target, cwd):
         t, c = os.path.realpath(target), os.path.realpath(cwd)
         return (t == c or t.startswith(c + os.sep)
-                or t.startswith(("/tmp/", "/private/tmp/", "/var/folders/", "/dev/fd/"))
+                or t.startswith(_SCRATCH_PREFIX)
                 or t in {"/dev/null", "/dev/zero", "/dev/tty", "/dev/stdin",
                          "/dev/stdout", "/dev/stderr", "/dev/random", "/dev/urandom"})
+
+    def is_scratch_root(path):
+        p = os.path.realpath(path)
+        return p.startswith(_SCRATCH_PREFIX)
 
 AUDIT_LOG = os.path.expanduser("~/.claude/harness-audit.log")
 
@@ -109,54 +117,65 @@ for pat, why in DENY_RULES:
     if re.search(pat, low):
         emit("deny", f"BLOCKED by harness: {why} Command: {CMD}")
 
-# ---- 2. ASK: gray-area risky (reversible-but-dangerous) ---------------------
-GRAY_RULES = [
-    (r"\bgit\s+push\b[^\n]*(--force\b|--force-with-lease\b|\s-\w*f|\s\+\S)",
-     "force-push can overwrite remote history."),
-    # Ask for reset --hard EXCEPT the routine "resync to an upstream/tracking
-    # ref" idiom (reset --hard origin/main, @{u}, FETCH_HEAD) — those discard
-    # local changes to match a ref you just fetched, which loops do constantly.
-    (r"\bgit\s+reset\s+--hard\b(?!\s+(?:\S+/\S+|@\{u|fetch_head))",
-     "git reset --hard to that target can discard commits/uncommitted work."),
-    (r"\bgit\s+clean\s+-[a-z]*f",
-     "git clean -f deletes untracked files."),
-    (r"\bgit\s+commit\b[^\n]*(--no-verify|\s-\w*n)",
-     "--no-verify skips the pre-commit gates."),
-    (r"\bgit\s+(filter-branch|filter-repo)\b",
-     "history rewrite."),
-    (r"\bgit\s+rebase\b",
-     "rebase rewrites commits."),
-    (r"\bsudo\b",
-     "sudo runs with elevated privileges."),
-    (r"(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|k)?sh\b",
-     "piping a network download straight into a shell executes untrusted code."),
-]
-for pat, why in GRAY_RULES:
-    if re.search(pat, low):
-        emit("ask", f"Harness: gray-area op needs your OK — {why} Command: {CMD}")
-
-# ---- 3. ASK: writes/deletes reaching outside the working directory ----------
-# Heuristic: only gate MUTATING commands and file-creating redirects. Reads
-# (cat/grep/ls) outside CWD pass, to keep the session fast. Relative paths are
-# resolved against CWD so "./build" stays inside; absolute/home paths that land
-# outside CWD -> ask for manual approval.
-import shlex  # noqa: E402  (kept local to this section)
-
-MUTATORS = ("rm", "rmdir", "mv", "cp", "install", "tee", "truncate",
-            "mkdir", "touch", "ln", "chmod", "chown", "dd")
+# ---- helpers: script-local var tracking + statement/effective-cwd walk -----
+# Split into statements once and track two things across them, in order, so
+# a LATER statement sees what an EARLIER one in the SAME command line set up:
+#   ASSIGNS    -- vars this command line itself export/assigned (see
+#                 expand_vars/record_assignments) so $HOME after an
+#                 `export HOME=/tmp/x` resolves to /tmp/x, not the hook
+#                 process's own environment.
+#   STMT_CWDS  -- the effective directory in scope at each statement, updated
+#                 by any `cd <path>` statement. Needed because the hook only
+#                 gets the SESSION's cwd (DATA["cwd"]) -- a command that does
+#                 `cd /tmp/loop && git rebase ...` runs the rebase in
+#                 /tmp/loop, not the session's cwd, so location-based checks
+#                 (is_scratch_root below, and the outside-cwd gate in
+#                 section 3) must track that shift, not just trust the
+#                 payload cwd.
+ASSIGNS = {}
+_ASSIGN_WORD = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
+_VAR_REF = re.compile(r"\$\{(\w+)\}|\$(\w+)")
 
 
-def outside_cwd(pathtok):
-    """Return the resolved target if it lands outside CWD (and isn't scratch/dev),
-    else None. Relative paths resolve against CWD."""
-    p = pathtok.replace("${HOME}", "~").replace("$HOME", "~")
-    p = os.path.expanduser(p)
-    if not os.path.isabs(p):
-        p = os.path.join(CWD, p)
-    tgt = os.path.realpath(p)
-    if is_trusted(tgt, CWD):
-        return None
-    return tgt
+def _unquote(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        return raw[1:-1]
+    return raw
+
+
+def expand_vars(s, assigns):
+    """Substitute $NAME / ${NAME} against `assigns` (what THIS command line has
+    itself export/assigned so far, e.g. `export HOME=/tmp/x`) before falling
+    back to the hook process's own environment. Unknown vars are left as-is
+    (e.g. $(cmd) substitutions, which this parser doesn't attempt)."""
+    def repl(m):
+        name = m.group(1) or m.group(2)
+        if name in assigns:
+            return assigns[name]
+        return os.environ.get(name, m.group(0))
+    return _VAR_REF.sub(repl, s)
+
+
+def record_assignments(stmt, assigns):
+    """If `stmt` is `[export] NAME=val [NAME2=val2 ...]`, record each NAME ->
+    val into `assigns` (quote-aware, resolving refs to vars already known)
+    so a LATER statement's $NAME resolves against what this command line
+    itself set -- not the hook process's own environment. This is what makes
+    e.g. `export HOME=/tmp/x; mkdir -p "$HOME"` recognized as writing inside
+    /tmp rather than the real $HOME. Stops at the first non-assignment word,
+    so plain commands (mkdir, rm, ...) and `FOO=bar cmd args` are untouched."""
+    try:
+        words = shlex.split(stmt, posix=False)
+    except ValueError:
+        return
+    if words and words[0] == "export":
+        words = words[1:]
+    for w in words:
+        m = _ASSIGN_WORD.match(w)
+        if not m:
+            break
+        assigns[m.group(1)] = expand_vars(_unquote(m.group(2)), assigns)
 
 
 def split_statements(cmd):
@@ -184,6 +203,100 @@ def split_statements(cmd):
             buf.append(c)
     stmts.append("".join(buf))
     return [s.strip() for s in stmts if s.strip()]
+
+
+def resolve_path(pathtok, assigns, base):
+    """Expand $VAR/~ (against `assigns`, i.e. this command line's own
+    export/assignments, falling back to the hook's own env) and resolve a
+    relative path against `base`. Shared by outside_cwd() and the `cd`-
+    tracking walk below so both use identical expansion rules."""
+    p = expand_vars(pathtok, assigns)
+    if p == "~" or p.startswith("~/"):
+        home = assigns.get("HOME") or os.environ.get("HOME")
+        if home:
+            p = home + p[1:]
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(base, p)
+    return os.path.realpath(p)
+
+
+def outside_cwd(pathtok, base):
+    """Return the resolved target if it lands outside `base` (and isn't
+    scratch/dev/trusted), else None."""
+    tgt = resolve_path(pathtok, ASSIGNS, base)
+    if is_trusted(tgt, base):
+        return None
+    return tgt
+
+
+STATEMENTS = split_statements(CMD)
+STMT_CWDS = []  # effective cwd in scope at each statement, same order
+_eff_cwd = os.path.realpath(CWD)
+for _stmt in STATEMENTS:
+    record_assignments(_stmt, ASSIGNS)
+    STMT_CWDS.append(_eff_cwd)
+    try:
+        _toks = shlex.split(_stmt)
+    except ValueError:
+        _toks = _stmt.split()
+    if _toks and _toks[0] == "cd":
+        _target = _toks[1] if len(_toks) > 1 else "~"
+        if _target != "-":  # `cd -` (previous dir): not tracked, don't guess
+            _eff_cwd = resolve_path(_target, ASSIGNS, _eff_cwd)
+
+# ---- 2. ASK: gray-area risky (reversible-but-dangerous) ---------------------
+# GLOBAL: blast radius reaches beyond the directory the command runs in (a
+# real remote, elevated privileges, arbitrary code exec) -- ask regardless of
+# location, scratch clone or not.
+GRAY_RULES_GLOBAL = [
+    (r"\bgit\s+push\b[^\n]*(--force\b|--force-with-lease\b|\s-\w*f|\s\+\S)",
+     "force-push can overwrite remote history."),
+    (r"\bsudo\b",
+     "sudo runs with elevated privileges."),
+    (r"(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|k)?sh\b",
+     "piping a network download straight into a shell executes untrusted code."),
+]
+for pat, why in GRAY_RULES_GLOBAL:
+    if re.search(pat, low):
+        emit("ask", f"Harness: gray-area op needs your OK — {why} Command: {CMD}")
+
+# LOCAL: git history-rewrite ops whose blast radius is confined to the repo
+# they run in. Skip the prompt when that repo's effective directory is
+# scratch/trusted (is_scratch_root) -- the same trust boundary the location
+# gate already uses in section 3, applied here because rewriting history in a
+# throwaway loop/remediation clone is exactly as disposable as any other
+# write there would be. Checked per-STATEMENT against that statement's own
+# effective cwd (STMT_CWDS from the walk above), so
+# `cd /tmp/loop && git rebase ...` is recognized as scratch even though the
+# session's own cwd is the real project directory.
+GRAY_RULES_LOCAL = [
+    (r"\bgit\s+reset\s+--hard\b(?!\s+(?:\S+/\S+|@\{u|fetch_head))",
+     "git reset --hard to that target can discard commits/uncommitted work."),
+    (r"\bgit\s+clean\s+-[a-z]*f",
+     "git clean -f deletes untracked files."),
+    (r"\bgit\s+commit\b[^\n]*(--no-verify|\s-\w*n)",
+     "--no-verify skips the pre-commit gates."),
+    (r"\bgit\s+(filter-branch|filter-repo)\b",
+     "history rewrite."),
+    (r"\bgit\s+rebase\b",
+     "rebase rewrites commits."),
+]
+for _stmt, _stmt_cwd in zip(STATEMENTS, STMT_CWDS):
+    _low_stmt = _stmt.lower()
+    for pat, why in GRAY_RULES_LOCAL:
+        if re.search(pat, _low_stmt) and not is_scratch_root(_stmt_cwd):
+            emit("ask",
+                 f"Harness: gray-area op needs your OK — {why} Command: {CMD}")
+
+# ---- 3. ASK: writes/deletes reaching outside the working directory ----------
+# Heuristic: only gate MUTATING commands and file-creating redirects. Reads
+# (cat/grep/ls) outside cwd pass, to keep the session fast. Relative paths
+# resolve against each statement's own effective cwd (STMT_CWDS, from the
+# walk above) so "./build" after a `cd` stays recognized as inside; absolute/
+# home paths that land outside -> ask for manual approval.
+MUTATORS = ("rm", "rmdir", "mv", "cp", "install", "tee", "truncate",
+            "mkdir", "touch", "ln", "chmod", "chown", "dd")
 
 
 def redirect_targets(stmt):
@@ -228,18 +341,20 @@ def redirect_targets(stmt):
     return out
 
 
-for stmt in split_statements(CMD):
-    # file-creating redirects (> / >>) whose target is outside CWD
+for stmt, stmt_cwd in zip(STATEMENTS, STMT_CWDS):
+    # file-creating redirects (> / >>) whose target is outside this
+    # statement's effective cwd
     for rt in redirect_targets(stmt):
         if rt.startswith("&") or rt == "/dev/null":
             continue
-        tgt = outside_cwd(rt)
+        tgt = outside_cwd(rt, stmt_cwd)
         if tgt:
             emit("ask",
                  f"Harness: redirect writes outside the working directory "
                  f"({rt} -> {tgt}); approve manually. Command: {CMD}")
 
-    # mutating command whose OWN target path is outside CWD
+    # mutating command whose OWN target path is outside this statement's
+    # effective cwd
     try:
         tokens = shlex.split(stmt)
     except ValueError:
@@ -252,7 +367,7 @@ for stmt in split_statements(CMD):
     for tok in tokens[1:]:
         if tok.startswith("-") or ("/" not in tok and not tok.startswith(("~", "$"))):
             continue
-        tgt = outside_cwd(tok)
+        tgt = outside_cwd(tok, stmt_cwd)
         if tgt:
             emit("ask",
                  f"Harness: {cmd_word} touches a path outside the working "
