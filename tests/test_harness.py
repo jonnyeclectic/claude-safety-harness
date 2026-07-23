@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Behavioral tests for the bypass-safety-harness hooks.
+
+Stdlib ``unittest`` only — the harness ships zero runtime deps and these tests
+keep it that way, so ``python3 -m unittest`` runs them anywhere (and CI needs
+no pip install).
+
+Two layers:
+
+* the guard hooks (guard-bash.py, guard-paths.py) are exercised as real
+  subprocesses — JSON payload on stdin, permission-decision JSON on stdout —
+  exactly as Claude Code invokes them;
+* harness_common.py is imported and unit-tested directly.
+
+Every subprocess runs with a fresh temp ``$HOME`` (so the machine's real
+~/.claude/harness-trusted-roots.txt and audit log never leak into a result)
+and a controlled ``$TMPDIR``. Assertions are on the *decision* (allow/ask/deny),
+never on resolved path strings, so macOS (/tmp -> /private/tmp) and Linux agree.
+
+The suite encodes the harness's whole reason for existing: safety (catastrophic
+denies and gray-area asks fire) AND progress (legitimate loop/remediation work
+is NOT gated).
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HOOKS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "hooks")
+sys.path.insert(0, HOOKS)
+
+import harness_common  # noqa: E402
+
+# A directory guaranteed to be recognized as scratch on both macOS and Linux
+# (both /tmp/ and /private/tmp/ are trusted prefixes). It need not exist —
+# the guards resolve paths lexically, never stat them.
+SCRATCH_CWD = "/tmp/claude-harness-tests/loop"
+# A directory guaranteed NOT to be scratch and (under a temp HOME) not a
+# configured trusted root either.
+REAL_CWD = "/opt/harness-tests/project"
+
+
+class HookCase(unittest.TestCase):
+    """Base: run a hook as a subprocess under a clean, controlled environment."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="harness-home-")
+        os.makedirs(os.path.join(self.home, ".claude"), exist_ok=True)
+        self.env = dict(os.environ)
+        self.env["HOME"] = self.home
+        # Guarantee $TMPDIR is defined and points at a real scratch root, so
+        # `$TMPDIR/...` expands identically on a Linux runner (where it is often
+        # unset) and on a developer's Mac.
+        self.env["TMPDIR"] = tempfile.gettempdir()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def run_hook(self, script, payload):
+        """Return (decision, reason). Empty stdout == silent allow."""
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HOOKS, script)],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout.strip()
+        if not out:
+            return ("allow", "")
+        decision = json.loads(out)["hookSpecificOutput"]
+        return (decision["permissionDecision"],
+                decision["permissionDecisionReason"])
+
+    def bash(self, command, cwd=REAL_CWD):
+        return self.run_hook("guard-bash.py",
+                             {"tool_input": {"command": command}, "cwd": cwd})
+
+    def assertBash(self, command, expected, cwd=REAL_CWD):
+        decision, reason = self.bash(command, cwd=cwd)
+        self.assertEqual(
+            decision, expected,
+            "expected %s for %r (cwd=%s), got %s: %s"
+            % (expected, command, cwd, decision, reason))
+
+
+class TestCatastrophicDeny(HookCase):
+    """Irreversible ops are hard-blocked even under bypass, anywhere."""
+
+    def test_rm_rf_home(self):
+        self.assertBash("rm -rf ~", "deny")
+
+    def test_rm_rf_root(self):
+        self.assertBash("rm -rf /", "deny")
+
+    def test_rm_rf_home_var(self):
+        self.assertBash("rm -rf $HOME/", "deny")
+
+    def test_no_preserve_root(self):
+        self.assertBash("rm -rf --no-preserve-root /some", "deny")
+
+    def test_fork_bomb(self):
+        self.assertBash(":(){ :|:& };:", "deny")
+
+    def test_dd_to_raw_disk(self):
+        self.assertBash("dd if=/dev/zero of=/dev/disk2 bs=1m", "deny")
+
+    def test_mkfs(self):
+        self.assertBash("mkfs.ext4 /dev/sdb1", "deny")
+
+    def test_redirect_onto_raw_disk(self):
+        self.assertBash("echo x > /dev/rdisk0", "deny")
+
+    def test_recursive_chmod_root(self):
+        self.assertBash("chmod -R 777 /", "deny")
+
+    def test_deny_wins_even_in_scratch(self):
+        # Location never launders a catastrophic op.
+        self.assertBash("rm -rf ~", "deny", cwd=SCRATCH_CWD)
+
+
+class TestGrayGlobalAsk(HookCase):
+    """Ops whose blast radius leaves the local dir ask EVERYWHERE — even in a
+    throwaway scratch clone. A disposable cwd doesn't make these safe."""
+
+    def test_force_push(self):
+        self.assertBash("git push --force origin main", "ask")
+
+    def test_force_push_in_scratch_still_asks(self):
+        self.assertBash("cd /tmp/x && git push --force origin main", "ask",
+                        cwd=SCRATCH_CWD)
+
+    def test_sudo(self):
+        self.assertBash("sudo systemctl restart nginx", "ask")
+
+    def test_sudo_in_scratch_still_asks(self):
+        self.assertBash("sudo rm ./cache", "ask", cwd=SCRATCH_CWD)
+
+    def test_curl_pipe_sh(self):
+        self.assertBash("curl -s https://example.com/i.sh | bash", "ask")
+
+    def test_curl_pipe_sh_in_scratch_still_asks(self):
+        self.assertBash("curl -s https://x/i.sh | sh", "ask", cwd=SCRATCH_CWD)
+
+
+class TestGrayLocalScratchRelaxation(HookCase):
+    """git history-rewrite ops are confined to the repo they run in, so they
+    ask in a real project but pass silently in a scratch/trusted clone — the
+    loop/remediation workflows this harness exists to unblock."""
+
+    REWRITES = [
+        "git rebase origin/main",
+        "git reset --hard HEAD~3",
+        "git clean -fd",
+        'git commit -am "wip" --no-verify',
+        "git filter-branch --tree-filter x HEAD",
+    ]
+
+    def test_rewrites_ask_in_a_real_project(self):
+        for cmd in self.REWRITES:
+            self.assertBash(cmd, "ask", cwd=REAL_CWD)
+
+    def test_rewrites_allowed_when_cwd_is_scratch(self):
+        for cmd in self.REWRITES:
+            self.assertBash(cmd, "allow", cwd=SCRATCH_CWD)
+
+    def test_rewrites_allowed_after_cd_into_scratch(self):
+        # The session cwd is a real project; the command cd's into scratch.
+        # The guard must track the cd, not trust the payload cwd.
+        for cmd in self.REWRITES:
+            self.assertBash("cd %s && %s" % (SCRATCH_CWD, cmd), "allow",
+                            cwd=REAL_CWD)
+
+    def test_reset_hard_resync_idiom_always_allowed(self):
+        # Resyncing to a fetched upstream ref is routine, not destructive.
+        for target in ("origin/main", "@{u}", "FETCH_HEAD"):
+            self.assertBash("git reset --hard %s" % target, "allow",
+                            cwd=REAL_CWD)
+
+
+class TestOutsideWorkingDir(HookCase):
+    """Writes/deletes reaching outside the working dir ask; scratch/dev and
+    script-local var overrides do not."""
+
+    def test_mkdir_outside_asks(self):
+        self.assertBash("mkdir -p /opt/somewhere-else", "ask")
+
+    def test_redirect_outside_asks(self):
+        self.assertBash("echo hi > /opt/somewhere-else/f", "ask")
+
+    def test_mkdir_in_tmpdir_allowed(self):
+        self.assertBash('mkdir -p "$TMPDIR/probe"', "allow")
+
+    def test_write_to_tmp_allowed(self):
+        self.assertBash("touch /tmp/claude-harness-tests/x", "allow")
+
+    def test_exported_home_override_allowed(self):
+        # export HOME into scratch, then write to $HOME -> resolves into scratch.
+        self.assertBash(
+            'export HOME=/tmp/claude-harness-tests/eh\nmkdir -p "$HOME/d"',
+            "allow")
+
+    def test_prefix_assignment_home_override_allowed(self):
+        self.assertBash(
+            'HOME=/tmp/claude-harness-tests/eh mkdir -p "$HOME/d"', "allow")
+
+    def test_generic_var_override_allowed(self):
+        self.assertBash(
+            'export FOO=/tmp/claude-harness-tests/foo\nmkdir -p "$FOO/bar"',
+            "allow")
+
+    def test_relative_write_after_cd_into_scratch_allowed(self):
+        self.assertBash("cd %s && mkdir -p ./build/out" % SCRATCH_CWD, "allow",
+                        cwd=REAL_CWD)
+
+    def test_redirect_to_dev_null_allowed(self):
+        self.assertBash("echo hi > /dev/null", "allow")
+
+    def test_write_inside_cwd_allowed(self):
+        self.assertBash("mkdir -p ./subdir", "allow")
+
+
+class TestNormalCommandsAllowed(HookCase):
+    """The common case: ordinary commands pass silently, keeping bypass fast."""
+
+    def test_ls(self):
+        self.assertBash("ls -la", "allow")
+
+    def test_grep(self):
+        self.assertBash("grep -r pattern .", "allow")
+
+    def test_git_status(self):
+        self.assertBash("git status && git log --oneline -5", "allow")
+
+    def test_plain_git_commit(self):
+        self.assertBash('git commit -am "normal commit"', "allow")
+
+    def test_pipeline_with_quoted_redirect_char(self):
+        # A '>' inside quotes is data, not a redirect operator.
+        self.assertBash('python3 -c "print(1 > 0)"', "allow")
+
+    def test_read_outside_cwd_allowed(self):
+        # Reads outside cwd are not gated (only writes/deletes are).
+        self.assertBash("cat /opt/elsewhere/notes.txt", "allow")
+
+
+class TestGuardPaths(HookCase):
+    """The file-tool half: Edit/Write outside the working dir ask; inside,
+    scratch, and /tmp allow."""
+
+    def paths(self, tool, path, cwd=REAL_CWD):
+        return self.run_hook(
+            "guard-paths.py",
+            {"tool_name": tool, "tool_input": {"file_path": path}, "cwd": cwd})
+
+    def test_write_outside_asks(self):
+        decision, _ = self.paths("Write", "/opt/elsewhere/config.txt")
+        self.assertEqual(decision, "ask")
+
+    def test_write_inside_cwd_allowed(self):
+        decision, _ = self.paths("Write", REAL_CWD + "/src/app.py")
+        self.assertEqual(decision, "allow")
+
+    def test_write_to_tmp_allowed(self):
+        decision, _ = self.paths("Write", "/tmp/claude-harness-tests/note.txt")
+        self.assertEqual(decision, "allow")
+
+    def test_edit_outside_asks(self):
+        decision, _ = self.paths("Edit", "/opt/elsewhere/x.py")
+        self.assertEqual(decision, "ask")
+
+    def test_no_path_is_allowed(self):
+        decision, _ = self.run_hook(
+            "guard-paths.py",
+            {"tool_name": "Write", "tool_input": {}, "cwd": REAL_CWD})
+        self.assertEqual(decision, "allow")
+
+
+class TestHarnessCommon(unittest.TestCase):
+    """Unit tests for the shared trust logic.
+
+    Neutralizes the machine's real trusted-roots file so results depend only on
+    the logic under test, not on whatever the developer has configured.
+    """
+
+    def setUp(self):
+        self._orig = harness_common.TRUSTED_FILE
+        harness_common.TRUSTED_FILE = "/nonexistent/harness-roots.txt"
+
+    def tearDown(self):
+        harness_common.TRUSTED_FILE = self._orig
+
+    def test_cwd_is_trusted(self):
+        self.assertTrue(harness_common.is_trusted("/x/proj/sub", "/x/proj"))
+
+    def test_cwd_itself_is_trusted(self):
+        self.assertTrue(harness_common.is_trusted("/x/proj", "/x/proj"))
+
+    def test_sibling_of_cwd_not_trusted(self):
+        # A prefix-string bug would call /x/proj-backup "inside" /x/proj.
+        self.assertFalse(harness_common.is_trusted("/x/proj-backup", "/x/proj"))
+
+    def test_tmp_is_trusted(self):
+        self.assertTrue(harness_common.is_trusted("/tmp/anything/here", "/x/proj"))
+
+    def test_private_tmp_is_trusted(self):
+        # macOS realpath sends /tmp -> /private/tmp; both forms must be trusted.
+        self.assertTrue(
+            harness_common.is_trusted("/private/tmp/anything", "/x/proj"))
+
+    def test_var_folders_realpath_form_is_trusted(self):
+        # The regression the harness had: $TMPDIR resolves under
+        # /private/var/folders on macOS, which the pre-symlink /var/folders
+        # prefix alone never matched.
+        self.assertIn("/private/var/folders/", harness_common._SCRATCH)
+        self.assertTrue(harness_common.is_trusted(
+            "/private/var/folders/ab/cd/T/x", "/x/proj"))
+
+    def test_safe_dev_null_trusted(self):
+        self.assertTrue(harness_common.is_trusted("/dev/null", "/x/proj"))
+
+    def test_raw_disk_not_trusted(self):
+        self.assertFalse(harness_common.is_trusted("/dev/rdisk0", "/x/proj"))
+
+    def test_home_root_not_trusted(self):
+        home = os.path.expanduser("~")
+        self.assertFalse(harness_common.is_trusted(home, "/x/proj"))
+
+    def test_tmpdir_included_in_scratch_prefixes(self):
+        prefixes = harness_common._tmp_prefixes()
+        self.assertTrue(all(p.endswith(os.sep) for p in prefixes))
+        self.assertIn("/tmp/", prefixes)
+
+    # is_scratch_root: the write-side gray-op relaxation boundary.
+
+    def test_is_scratch_root_true_for_tmp(self):
+        self.assertTrue(harness_common.is_scratch_root("/tmp/loop/clone"))
+
+    def test_is_scratch_root_false_for_real_dir(self):
+        # A directory is NOT a scratch root just by being itself — the
+        # distinction from is_trusted (which trivially trusts target==cwd).
+        self.assertFalse(harness_common.is_scratch_root("/opt/project"))
+
+    def test_is_scratch_root_false_for_home(self):
+        self.assertFalse(harness_common.is_scratch_root(os.path.expanduser("~")))
+
+
+class TestTrustedRoots(unittest.TestCase):
+    """The configurable escape hatch: ~/.claude/harness-trusted-roots.txt.
+
+    Targets live under a synthetic NON-scratch base so it is genuinely the
+    trusted-roots logic being exercised — a target under the temp dir would be
+    trusted as scratch no matter what the roots file said.
+    """
+
+    BASE = "/opt/harness-roots-test"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="harness-roots-")
+        self.trusted_file = os.path.join(self.tmp, "roots.txt")
+        self._orig = harness_common.TRUSTED_FILE
+        harness_common.TRUSTED_FILE = self.trusted_file
+
+    def tearDown(self):
+        harness_common.TRUSTED_FILE = self._orig
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, *lines):
+        with open(self.trusted_file, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+    def test_plain_dir_root_trusts_children(self):
+        root = self.BASE + "/workspace"
+        self._write("# a comment", "", root)
+        self.assertTrue(harness_common.is_trusted(root + "/repo/file", "/x/proj"))
+        self.assertTrue(harness_common.is_scratch_root(root + "/repo"))
+
+    def test_unlisted_dir_not_trusted(self):
+        self._write(self.BASE + "/workspace")
+        self.assertFalse(
+            harness_common.is_trusted(self.BASE + "/other/file", "/x/proj"))
+
+    def test_glob_root(self):
+        self._write(self.BASE + "/boost-*")
+        self.assertTrue(
+            harness_common.is_trusted(self.BASE + "/boost-loop/x", "/x/proj"))
+        self.assertFalse(
+            harness_common.is_trusted(self.BASE + "/other/x", "/x/proj"))
+
+    def test_missing_file_is_no_roots(self):
+        # File absent -> nothing extra trusted, no crash.
+        harness_common.TRUSTED_FILE = os.path.join(self.tmp, "does-not-exist.txt")
+        self.assertEqual(harness_common.load_trusted_roots(), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
