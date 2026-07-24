@@ -623,6 +623,15 @@ for _stmt, _stmt_cwd in zip(STATEMENTS, STMT_CWDS):
 MUTATORS = ("rm", "rmdir", "mv", "cp", "install", "tee", "truncate",
             "mkdir", "touch", "ln", "chmod", "chown", "dd")
 
+# Mutators that READ their leading operand(s) and WRITE only the final one:
+# `cp`/`install` copy FROM source(s) INTO a destination, `ln` links a target
+# name into a new link. Reads outside cwd are fine (see the section header), so
+# only the DESTINATION is a real out-of-cwd write worth gating -- otherwise
+# `cp "$HOME/.cache/x" "$TMPDIR/y"` asks for the source it merely reads. `mv` is
+# deliberately excluded: it REMOVES its sources, so an out-of-cwd source there is
+# a genuine mutation and stays gated.
+COPY_LIKE = {"cp", "install", "ln"}
+
 
 def redirect_targets(stmt):
     """Yield the target of each real (unquoted) > or >> operator in `stmt`. A '>'
@@ -666,6 +675,24 @@ def redirect_targets(stmt):
     return out
 
 
+def write_targets(cmd_word, tokens):
+    """The path operands a mutator actually WRITES/REMOVES -- the ones worth
+    gating against the out-of-cwd rule. For a COPY_LIKE command that is only the
+    destination: the value of `-t`/`--target-directory` if present, else the last
+    non-flag operand (its leading operands are read sources). For every other
+    mutator, all operands are targets."""
+    operands = tokens[1:]
+    if cmd_word not in COPY_LIKE:
+        return operands
+    for i, t in enumerate(operands):
+        if t in ("-t", "--target-directory") and i + 1 < len(operands):
+            return [operands[i + 1]]
+        if t.startswith("--target-directory="):
+            return [t.split("=", 1)[1]]
+    positional = [t for t in operands if not t.startswith("-")]
+    return positional[-1:]  # the destination only (empty if no operands)
+
+
 for stmt, stmt_cwd in zip(STATEMENTS, STMT_CWDS):
     # file-creating redirects (> / >>) whose target is outside this
     # statement's effective cwd
@@ -689,13 +716,13 @@ for stmt, stmt_cwd in zip(STATEMENTS, STMT_CWDS):
     cmd_word = os.path.basename(tokens[0])
     if cmd_word not in MUTATORS:
         continue
-    for tok in tokens[1:]:
+    for tok in write_targets(cmd_word, tokens):
         if tok.startswith("-") or ("/" not in tok and not tok.startswith(("~", "$"))):
             continue
         tgt = outside_cwd(tok, stmt_cwd)
         if tgt:
             emit("ask",
-                 f"Harness: {cmd_word} touches a path outside the working "
+                 f"Harness: {cmd_word} writes to a path outside the working "
                  f"directory ({tok} -> {tgt}); approve manually. Command: {CMD}")
 
 # ---- default: allow ---------------------------------------------------------
