@@ -510,6 +510,62 @@ class TestOutsideWorkingDir(HookCase):
         self.assertBash("mkdir -p ./subdir", "allow")
 
 
+class TestCopyReadsSource(HookCase):
+    """`cp`/`install`/`ln` READ their leading operand(s) and WRITE only the
+    destination. Reads outside the working dir are fine, so an out-of-cwd SOURCE
+    must not ask -- only an out-of-cwd DESTINATION does. `mv` still gates its
+    source (it removes it). Uses explicit /opt paths for 'outside', since the
+    test's own $HOME is a scratch temp dir."""
+
+    OUT = "/opt/elsewhere"        # outside REAL_CWD and not scratch
+    SCR = "$TMPDIR/dst"           # a real scratch destination in the test env
+
+    # --- source outside cwd is a read -> allowed ----------------------------
+
+    def test_cp_external_source_to_scratch_allowed(self):
+        self.assertBash('cp %s/src %s' % (self.OUT, self.SCR), "allow")
+
+    def test_cp_reported_precommit_cache_allowed(self):
+        # The exact reported shape (source read from ~/.cache, dest in scratch).
+        self.assertBash('cp -R "$HOME/.cache/pre-commit" "$TMPDIR/pc-cache"',
+                        "allow")
+
+    def test_install_external_source_to_scratch_allowed(self):
+        self.assertBash('install -m 755 %s/tool %s' % (self.OUT, self.SCR),
+                        "allow")
+
+    def test_ln_external_target_local_link_allowed(self):
+        # The link target is just a string; only the new link path is written.
+        self.assertBash('ln -s %s/target ./link' % self.OUT, "allow")
+
+    def test_cp_dasht_scratch_dir_external_source_allowed(self):
+        self.assertBash('cp -t "$TMPDIR/d" %s/a' % self.OUT, "allow")
+
+    # --- destination outside cwd is a write -> still asks --------------------
+
+    def test_cp_to_outside_destination_asks(self):
+        self.assertBash('cp ./local %s/dest' % self.OUT, "ask")
+
+    def test_install_to_system_destination_asks(self):
+        self.assertBash('install -m 755 ./tool %s/bin/tool' % self.OUT, "ask")
+
+    def test_ln_to_outside_link_asks(self):
+        self.assertBash('ln -sf ./t %s/link' % self.OUT, "ask")
+
+    def test_cp_dasht_outside_dir_asks(self):
+        self.assertBash('cp -t %s/d ./a' % self.OUT, "ask")
+
+    # --- mv is not copy-like: it removes its source -> still gated -----------
+
+    def test_mv_external_source_still_asks(self):
+        self.assertBash('mv %s/src %s' % (self.OUT, self.SCR), "ask")
+
+    # --- inside cwd stays silent --------------------------------------------
+
+    def test_cp_inside_cwd_allowed(self):
+        self.assertBash("cp ./a ./b", "allow")
+
+
 class TestNormalCommandsAllowed(HookCase):
     """The common case: ordinary commands pass silently, keeping bypass fast."""
 
