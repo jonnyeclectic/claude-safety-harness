@@ -1,19 +1,35 @@
 #!/usr/bin/env python3
 """Stop hook: nudge to run the project's tests before finishing.
 
-Fires when the session is wrapping up. If source files inside the working
-directory were modified and NO test/check command ran afterward, it blocks the
+Fires when the session is wrapping up. If a CODE file inside the working
+directory was modified and NO test/check command ran afterward, it blocks the
 stop once with a reason telling Claude to verify functionality is preserved by
 running the project's test command (auto-detected: make check/test, pytest, npm
-test, cargo test, go test, ...). Stays silent for Q&A / docs-only / already-
-tested sessions, and never loops (guarded by stop_hook_active).
+test, cargo test, go test, ...). Stays silent for Q&A / docs-only / config-or-
+data-only / already-tested sessions, and never loops (guarded by
+stop_hook_active).
 """
 import json
 import os
 import re
 import sys
 
-DOC_EXT = (".md", ".markdown", ".rst", ".txt", ".adoc")
+# Extensions whose edits a test run would actually exercise. The nudge exists to
+# verify CODE still works, so it fires ONLY for these -- never for docs, config,
+# data, lockfiles, CI yaml, or dotfiles like .gitignore. Those used to count as
+# "source" (anything not a doc did), so touching one LAST -- e.g. a trailing
+# .gitignore tweak after the real code was already tested -- spuriously re-fired
+# the nag. An allowlist also means the worst case is a missed reminder (cheap),
+# never a false block (friction), which is the right bias for an advisory hook.
+CODE_EXT = (
+    ".py", ".pyi", ".pyx",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte",
+    ".go", ".rs", ".rb", ".java", ".kt", ".kts", ".scala", ".groovy", ".clj",
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs",
+    ".swift", ".m", ".mm", ".php", ".pl", ".pm",
+    ".ex", ".exs", ".erl", ".hs", ".ml", ".fs", ".dart", ".lua",
+    ".sh", ".bash", ".zsh", ".sql", ".r", ".jl",
+)
 
 # a test/check invocation, tolerant of an rtk/sudo/etc. prefix
 TEST_RUN = re.compile(
@@ -119,7 +135,7 @@ def main():
                             continue
                         tgt = os.path.realpath(os.path.expanduser(path))
                         inside = tgt == cwd or tgt.startswith(cwd + os.sep)
-                        if inside and not tgt.lower().endswith(DOC_EXT):
+                        if inside and tgt.lower().endswith(CODE_EXT):
                             last_edit = idx
                             edited_something = True
                     elif name == "Bash":
