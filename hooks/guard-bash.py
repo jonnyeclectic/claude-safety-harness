@@ -329,9 +329,10 @@ DENY_RULES = [
     (r"\bchown\b[^\n]*-[a-z]*r[a-z]*\s+\S+\s+/" + _END,
      "Recursive chown on / breaks the system."),
 ]
-for pat, why in DENY_RULES:
-    if re.search(pat, low):
-        emit("deny", f"BLOCKED by harness: {why} Command: {CMD}")
+# These rules FIRE below, after the assignment / effective-cwd walk is built, so
+# the whole-tree rm rule (index 0) can honor a HOME reassignment made on the SAME
+# command line (`export HOME="$TMPDIR/x" && rm -rf "$HOME"`) instead of reading
+# `~`/`$HOME` as the user's real home -- see _rm_home_reassigned_to_scratch.
 
 # ---- helpers: script-local var tracking + statement/effective-cwd walk -----
 # Split into statements once and track two things across them, in order, so
@@ -437,6 +438,66 @@ for _stmt in STATEMENTS:
         _target = _toks[1] if len(_toks) > 1 else "~"
         if _target != "-":  # `cd -` (previous dir): not tracked, don't guess
             _eff_cwd = resolve_path(_target, ASSIGNS, _eff_cwd)
+
+
+# ---- 1 (fired): DENY, now that ASSIGNS / STATEMENTS / STMT_CWDS exist --------
+def _rm_home_reassigned_to_scratch():
+    """The whole-tree rm DENY (DENY_RULES[0]) is a FALSE POSITIVE when the
+    command line ITSELF reassigned HOME (via `export HOME=...` or a `HOME=... rm`
+    prefix) to a throwaway path and the rm deletes THAT -- the routine
+    `export HOME="$TMPDIR/x" && rm -rf "$HOME"` test-isolation idiom, where `~`
+    and `$HOME` no longer mean the user's real home.
+
+    Return True (suppress the deny) only when HOME was reassigned on THIS line AND
+    every recursive-rm statement targets ONLY safe paths: a `~`/`$HOME` that now
+    resolves into a scratch/trusted dir (rescued), or a specific non-root path.
+    A literal `/`, a root wildcard, or a home ref that resolves OUTSIDE scratch
+    returns False so the catastrophic deny stands. Conservative by construction:
+    ambient (un-reassigned) HOME, an rm hidden in a substitution (no top-level rm
+    statement to rescue), or any parse doubt all leave the deny in place."""
+    if "HOME" not in ASSIGNS:
+        return False                  # ambient home -> a real-home wipe -> deny
+    rescued = False
+    for _s, _base in zip(STATEMENTS, STMT_CWDS):
+        try:
+            _rtoks = shlex.split(_s, posix=False)
+        except ValueError:
+            return False
+        # step past a leading `export` and any NAME=val prefix assignments
+        if _rtoks and _unquote(_rtoks[0]) == "export":
+            _rtoks = _rtoks[1:]
+        while _rtoks and _ASSIGN_WORD.match(_unquote(_rtoks[0])):
+            _rtoks = _rtoks[1:]
+        if not _rtoks or os.path.basename(_unquote(_rtoks[0])) != "rm":
+            continue
+        _args = _rtoks[1:]
+        if not any(t.startswith("-") and not t.startswith("--")
+                   and "r" in t.lower() for t in _args):
+            continue                  # non-recursive rm cannot wipe a tree
+        for _tok in _args:
+            if _tok.startswith("-"):
+                continue
+            _core = _unquote(_tok)
+            if _core.endswith("/*"):
+                _core = _core[:-2]
+            elif _core.endswith("/") and len(_core) > 1:
+                _core = _core[:-1]
+            if _core in ("", "/"):
+                return False          # whole-root target -> keep the deny
+            if _core in ("~", "$HOME", "${HOME}"):
+                _tgt = resolve_path(_core, ASSIGNS, _base)
+                if is_scratch_root(_tgt) or is_trusted(_tgt, _base):
+                    rescued = True     # reassigned home now points at scratch
+                else:
+                    return False       # reassigned, but not to a safe place
+    return rescued
+
+
+for _i, (_pat, _why) in enumerate(DENY_RULES):
+    if re.search(_pat, low):
+        if _i == 0 and _rm_home_reassigned_to_scratch():
+            continue                  # in-line HOME reassignment -> not real home
+        emit("deny", f"BLOCKED by harness: {_why} Command: {CMD}")
 
 # Branches whose force-push is a real, everyone-affecting history overwrite.
 # Force-pushing any OTHER explicit branch is the routine amend->force-push

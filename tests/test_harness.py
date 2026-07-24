@@ -162,6 +162,78 @@ class TestDenyInsideSubstitution(HookCase):
         self.assertBash('echo "$(%shome/u/proj/build)"' % self.RMRF, "allow")
 
 
+class TestReassignedHomeRm(HookCase):
+    """`rm -rf $HOME`/`~` after the command line ITSELF reassigned HOME to a
+    scratch/trusted path deletes that throwaway dir, not the user's real home --
+    the standard `export HOME="$TMPDIR/x" && rm -rf "$HOME"` test-isolation
+    idiom. It must be allowed. An AMBIENT (un-reassigned) home, a literal root,
+    an rm hidden in a substitution, or a reassignment to a non-scratch place must
+    all still DENY -- a HOME export never launders those."""
+
+    RMRF = "r" + "m -rf"          # command + flags; target is appended per case
+    TH = "$TMPDIR/deptest-home"   # $TMPDIR is a real scratch root in the test env
+
+    # --- reassigned to scratch/trusted -> allowed ---------------------------
+
+    def test_reassign_export_quoted(self):
+        self.assertBash('export HOME="%s" && %s "$HOME"' % (self.TH, self.RMRF),
+                        "allow")
+
+    def test_reassign_export_unquoted(self):
+        # Unquoted $HOME reaches the DENY scanner as `$home`; the suppression
+        # resolves it against the in-line export and sees scratch.
+        self.assertBash('export HOME=%s && %s $HOME' % (self.TH, self.RMRF),
+                        "allow")
+
+    def test_reassign_export_tilde(self):
+        self.assertBash('export HOME=%s && %s ~' % (self.TH, self.RMRF), "allow")
+
+    def test_reassign_prefix_assignment(self):
+        self.assertBash('HOME=%s %s $HOME' % (self.TH, self.RMRF), "allow")
+
+    def test_reassign_home_wildcard(self):
+        self.assertBash('export HOME=%s && %s $HOME/*' % (self.TH, self.RMRF),
+                        "allow")
+
+    def test_reassign_into_cwd_allowed(self):
+        # HOME reassigned to a dir INSIDE the working directory -> trusted.
+        self.assertBash('export HOME=%s/h && %s $HOME' % (REAL_CWD, self.RMRF),
+                        "allow", cwd=REAL_CWD)
+
+    def test_full_isolation_idiom(self):
+        # The real-world shape: cd into scratch, retarget HOME, wipe+recreate it.
+        self.assertBash(
+            'cd %s && export HOME="%s" && %s "$HOME" && mkdir -p "$HOME"'
+            % (SCRATCH_CWD, self.TH, self.RMRF), "allow", cwd=REAL_CWD)
+
+    # --- must STILL deny ----------------------------------------------------
+
+    def test_ambient_home_var_still_denies(self):
+        self.assertBash('%s $HOME' % self.RMRF, "deny")
+
+    def test_ambient_tilde_still_denies(self):
+        self.assertBash('%s ~' % self.RMRF, "deny")
+
+    def test_reassigned_home_but_rm_root_denies(self):
+        # A HOME export never launders a literal-root wipe on the same line.
+        self.assertBash('export HOME=%s && %s /' % (self.TH, self.RMRF), "deny")
+
+    def test_reassigned_home_but_rm_root_wildcard_denies(self):
+        self.assertBash('export HOME=%s && %s /*' % (self.TH, self.RMRF), "deny")
+
+    def test_reassign_to_nonscratch_still_denies(self):
+        # Reassigning HOME to a real, non-scratch dir is not laundered: an
+        # rm -rf of it looks exactly like a whole-home wipe -> stays denied.
+        self.assertBash('export HOME=/opt/not-scratch && %s $HOME' % self.RMRF,
+                        "deny", cwd=REAL_CWD)
+
+    def test_rm_in_substitution_not_rescued(self):
+        # The rm hides inside a substitution (no top-level rm statement to
+        # inspect), so even with a HOME export the catastrophic deny stands.
+        self.assertBash('export HOME=%s && echo "$(%s /)"' % (self.TH, self.RMRF),
+                        "deny")
+
+
 class TestGrayGlobalAsk(HookCase):
     """Ops whose blast radius leaves the local dir ask EVERYWHERE — even in a
     throwaway scratch clone. A disposable cwd doesn't make these safe."""
