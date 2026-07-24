@@ -337,9 +337,10 @@ class TestGrayLocalScratchRelaxation(HookCase):
     loop/remediation workflows this harness exists to unblock."""
 
     # Ops that can destroy committed or uncommitted WORK. --no-verify is NOT
-    # here: it destroys nothing (see TestCommitNoVerify).
+    # here: it destroys nothing (see TestCommitNoVerify). `git rebase` is NOT
+    # here either: it is local + reflog-recoverable and branch-aware now, so it
+    # asks only on a protected branch (see TestRebaseTopicBranch).
     REWRITES = [
-        "git rebase origin/main",
         "git reset --hard HEAD~3",
         "git clean -fd",
         "git filter-branch --tree-filter x HEAD",
@@ -365,6 +366,80 @@ class TestGrayLocalScratchRelaxation(HookCase):
         for target in ("origin/main", "@{u}", "FETCH_HEAD"):
             self.assertBash("git reset --hard %s" % target, "allow",
                             cwd=REAL_CWD)
+
+
+class TestRebaseTopicBranch(HookCase):
+    """`git rebase` is local and reflog-recoverable, and its one irreversible
+    shared step (force-push) is gated separately, so it asks ONLY when it would
+    rewrite a PROTECTED branch's history -- the effective checked-out branch
+    (tracked from a `git checkout`/`switch` earlier on the line) is main/master/
+    develop/trunk. A topic-branch rebase, or a standalone rebase whose branch is
+    not visible, is the routine idiom and is allowed. Scratch clones are exempt
+    entirely (see TestGrayLocalScratchRelaxation)."""
+
+    # --- allowed: topic-branch / unknown-branch rebases ---------------------
+
+    def test_checkout_topic_then_rebase_allowed(self):
+        self.assertBash("git checkout feat/x && git rebase main", "allow",
+                        cwd=REAL_CWD)
+
+    def test_standalone_rebase_unknown_branch_allowed(self):
+        # The common case: already on your topic branch, no checkout on the line.
+        self.assertBash("git rebase main", "allow", cwd=REAL_CWD)
+
+    def test_standalone_rebase_origin_upstream_allowed(self):
+        self.assertBash("git rebase origin/main", "allow", cwd=REAL_CWD)
+
+    def test_standalone_interactive_rebase_allowed(self):
+        self.assertBash("git rebase -i HEAD~3", "allow", cwd=REAL_CWD)
+
+    def test_switch_create_topic_then_rebase_allowed(self):
+        self.assertBash("git switch -c feat/y && git rebase main", "allow",
+                        cwd=REAL_CWD)
+
+    def test_last_checkout_wins_topic_allowed(self):
+        # main checked out first, then a topic branch: the rebase rewrites topic.
+        self.assertBash(
+            "git checkout main && git checkout feat/z && git rebase main",
+            "allow", cwd=REAL_CWD)
+
+    def test_real_world_update_main_then_rebase_allowed(self):
+        cmd = ("git checkout main 2>&1 | tail -1\n"
+               "git fetch https://example.com/r.git main 2>&1 | tail -2\n"
+               "git merge --ff-only FETCH_HEAD 2>&1 | tail -2\n"
+               "git checkout feat/roadmap-tracker 2>&1 | tail -1\n"
+               "git rebase main 2>&1 | tail -3\n"
+               "git log --oneline main..HEAD")
+        self.assertBash(cmd, "allow", cwd=REAL_CWD)
+
+    def test_rebase_named_in_commit_message_allowed(self):
+        # A commit message is data, not code -> the rebase verb never matches.
+        self.assertBash('git commit -m "todo: git rebase main"', "allow",
+                        cwd=REAL_CWD)
+
+    # --- ask: rebase that rewrites a protected branch -----------------------
+
+    def test_on_main_asks(self):
+        self.assertBash("git checkout main && git rebase origin/main", "ask",
+                        cwd=REAL_CWD)
+
+    def test_on_master_via_switch_asks(self):
+        self.assertBash("git switch master && git rebase upstream", "ask",
+                        cwd=REAL_CWD)
+
+    def test_on_develop_asks(self):
+        self.assertBash("git checkout develop && git rebase main", "ask",
+                        cwd=REAL_CWD)
+
+    def test_on_trunk_asks(self):
+        self.assertBash("git checkout trunk && git rebase main", "ask",
+                        cwd=REAL_CWD)
+
+    # --- scratch overrides even the protected-branch ask --------------------
+
+    def test_on_protected_but_scratch_allowed(self):
+        self.assertBash("git checkout main && git rebase x", "allow",
+                        cwd=SCRATCH_CWD)
 
 
 class TestCommitNoVerify(HookCase):
