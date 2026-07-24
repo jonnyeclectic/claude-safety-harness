@@ -420,16 +420,44 @@ def outside_cwd(pathtok, base):
     return tgt
 
 
+def _checkout_branch(toks):
+    """If `toks` is a `git checkout`/`git switch` that lands on a branch, return
+    that branch name, else None. Handles `-b`/`-B`/`-c`/`-C NEWBRANCH` (create +
+    switch) and a plain `checkout <branch>`. A `checkout -- <file>` returns None;
+    a pathspec checkout may return the token, but that only ever reads as a
+    non-protected name (-> allowed), so misreading a file as a branch never
+    suppresses a real protected-branch prompt. Used to track which branch a
+    later `git rebase` on the same command line would rewrite."""
+    if len(toks) < 3 or os.path.basename(toks[0]) != "git":
+        return None
+    if toks[1] not in ("checkout", "switch"):
+        return None
+    rest = toks[2:]
+    for i, t in enumerate(rest):
+        if t in ("-b", "-B", "-c", "-C") and i + 1 < len(rest):
+            return rest[i + 1]
+    for t in rest:
+        if t == "--":
+            break
+        if t.startswith("-"):
+            continue
+        return t
+    return None
+
+
 # Heredoc bodies are stripped first: for a non-interpreter receiver they are
 # stdin data, not executed, so a `mkdir /outside` or `cd /elsewhere` inside one
 # must not drive the cd-tracking or out-of-cwd checks. A `bash <<EOF` body IS
 # kept (see _strip_heredocs) and so is still walked.
 STATEMENTS = split_statements(_strip_heredocs(CMD))
 STMT_CWDS = []  # effective cwd in scope at each statement, same order
+STMT_BRANCHES = []  # effective checked-out branch at each statement (None=unknown)
 _eff_cwd = os.path.realpath(CWD)
+_eff_branch = None  # the hook is not told the session's current branch
 for _stmt in STATEMENTS:
     record_assignments(_stmt, ASSIGNS)
     STMT_CWDS.append(_eff_cwd)
+    STMT_BRANCHES.append(_eff_branch)  # branch in scope BEFORE this stmt's checkout
     try:
         _toks = shlex.split(_stmt)
     except ValueError:
@@ -438,6 +466,9 @@ for _stmt in STATEMENTS:
         _target = _toks[1] if len(_toks) > 1 else "~"
         if _target != "-":  # `cd -` (previous dir): not tracked, don't guess
             _eff_cwd = resolve_path(_target, ASSIGNS, _eff_cwd)
+    _br = _checkout_branch(_toks)
+    if _br is not None:
+        _eff_branch = _br
 
 
 # ---- 1 (fired): DENY, now that ASSIGNS / STATEMENTS / STMT_CWDS exist --------
@@ -598,21 +629,36 @@ GRAY_RULES_LOCAL = [
      "git clean -f deletes untracked files."),
     (r"\bgit\s+(filter-branch|filter-repo)\b",
      "history rewrite."),
-    (r"\bgit\s+rebase\b",
-     "rebase rewrites commits."),
 ]
+# `git rebase` is handled separately (below): unlike the rules above it is LOCAL
+# and reflog-recoverable, and its one irreversible SHARED step -- force-pushing
+# the result -- is gated on its own (force_push_asks). So it asks only when it
+# rewrites a PROTECTED branch's history, not for the routine topic-branch rebase.
 # NB: `git commit --no-verify` / `-n` is deliberately NOT gated. Every rule
 # above can destroy committed or uncommitted WORK; --no-verify destroys nothing
 # and touches nothing outside the repo -- it only skips optional pre-commit
 # hooks, a code-quality concern, not the catastrophic/outward-facing threat this
 # advisory layer exists for. Gating it just stalled routine automated commits
 # (agent loops use it constantly) with no safety return.
-for _stmt, _stmt_cwd in zip(STATEMENTS, STMT_CWDS):
+for _stmt, _stmt_cwd, _stmt_branch in zip(STATEMENTS, STMT_CWDS, STMT_BRANCHES):
+    if is_scratch_root(_stmt_cwd):
+        continue  # disposable loop/remediation clone -> skip local-rewrite prompts
     _low_stmt = code_only(_stmt).lower()  # don't match a git verb inside a message
     for pat, why in GRAY_RULES_LOCAL:
-        if re.search(pat, _low_stmt) and not is_scratch_root(_stmt_cwd):
+        if re.search(pat, _low_stmt):
             emit("ask",
                  f"Harness: gray-area op needs your OK — {why} Command: {CMD}")
+    # git rebase: ask only when the effective checked-out branch (tracked from a
+    # `git checkout`/`switch` earlier on this command line) is a PROTECTED branch,
+    # i.e. the rebase would rewrite main/master/develop/trunk history. Rebasing a
+    # topic branch onto an updated main, or a standalone `git rebase <upstream>`
+    # whose branch we cannot see, is the routine idiom and is allowed.
+    if (re.search(r"\bgit\s+rebase\b", _low_stmt)
+            and _stmt_branch is not None
+            and _stmt_branch.lower() in _PROTECTED_BRANCHES):
+        emit("ask",
+             "Harness: gray-area op needs your OK — rebase rewrites the history "
+             f"of protected branch '{_stmt_branch}'. Command: {CMD}")
 
 # ---- 3. ASK: writes/deletes reaching outside the working directory ----------
 # Heuristic: only gate MUTATING commands and file-creating redirects. Reads
