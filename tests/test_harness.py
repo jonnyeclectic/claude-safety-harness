@@ -566,6 +566,92 @@ class TestGuardPaths(HookCase):
         self.assertEqual(decision, "allow")
 
 
+class TestNudgeTests(HookCase):
+    """The Stop hook (nudge-tests.py) blocks the stop once when a CODE file in
+    the working dir was edited with no test run after it. A non-code file --
+    docs, config, data, or a dotfile like .gitignore -- must NEVER trip it, so a
+    trailing `.gitignore` tweak after the real code was already tested does not
+    re-fire the nag (the real-world false positive this class pins down)."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = tempfile.mkdtemp(prefix="nudge-proj-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.proj, ignore_errors=True)
+        super().tearDown()
+
+    def nudge(self, events, stop_hook_active=False):
+        """events: list of ("edit", relpath|abspath) / ("test", command).
+        Returns "block" (nudge fired) or "allow" (silent)."""
+        tpath = os.path.join(self.home, "transcript.jsonl")
+        with open(tpath, "w", encoding="utf-8") as fh:
+            for kind, val in events:
+                if kind == "edit":
+                    p = val if os.path.isabs(val) else os.path.join(self.proj, val)
+                    tu = {"type": "tool_use", "name": "Write",
+                          "input": {"file_path": p}}
+                else:
+                    tu = {"type": "tool_use", "name": "Bash",
+                          "input": {"command": val}}
+                fh.write(json.dumps({"message": {"content": [tu]}}) + "\n")
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HOOKS, "nudge-tests.py")],
+            input=json.dumps({"cwd": self.proj, "transcript_path": tpath,
+                              "stop_hook_active": stop_hook_active}),
+            capture_output=True, text=True, env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout.strip()
+        return json.loads(out)["decision"] if out else "allow"
+
+    # --- fires (real code went untested) ------------------------------------
+
+    def test_code_edit_untested_blocks(self):
+        self.assertEqual(self.nudge([("edit", "src/app.py")]), "block")
+
+    def test_code_edit_then_test_allows(self):
+        self.assertEqual(
+            self.nudge([("edit", "src/app.py"), ("test", "make check")]),
+            "allow")
+
+    def test_code_edit_after_test_still_blocks(self):
+        # A fresh code edit AFTER the last test run must re-arm the nudge.
+        self.assertEqual(
+            self.nudge([("edit", "a.py"), ("test", "pytest"), ("edit", "b.py")]),
+            "block")
+
+    # --- does NOT fire (non-code / outside / already handled) ---------------
+
+    def test_gitignore_only_allows(self):
+        self.assertEqual(self.nudge([("edit", ".gitignore")]), "allow")
+
+    def test_trailing_gitignore_after_test_allows(self):
+        # The exact reported shape: code edited + tested, then a .gitignore tweak.
+        self.assertEqual(
+            self.nudge([("edit", "src/app.py"), ("test", "make check"),
+                        ("edit", ".gitignore")]),
+            "allow")
+
+    def test_doc_only_allows(self):
+        self.assertEqual(self.nudge([("edit", "README.md")]), "allow")
+
+    def test_config_and_data_only_allows(self):
+        for f in ("pyproject.toml", "docker-compose.yml",
+                  ".github/workflows/ci.yml", "data/prices.csv", "config.json"):
+            self.assertEqual(self.nudge([("edit", f)]), "allow", f)
+
+    def test_edit_outside_cwd_allows(self):
+        # A code file written OUTSIDE the working dir (e.g. a user-global skill
+        # install under ~/.claude) is not this project's source -> no nudge.
+        self.assertEqual(
+            self.nudge([("edit", os.path.join(self.home, "s.py"))]), "allow")
+
+    def test_stop_hook_active_does_not_loop(self):
+        self.assertEqual(
+            self.nudge([("edit", "src/app.py")], stop_hook_active=True), "allow")
+
+
 class TestHarnessCommon(unittest.TestCase):
     """Unit tests for the shared trust logic.
 
