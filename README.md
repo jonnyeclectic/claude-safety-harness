@@ -35,8 +35,8 @@ gap the sandbox can't (the built-in file tools aren't sandboxed). Belt and suspe
   claudex  ──►  claude --dangerously-skip-permissions --settings <sandbox> --add-dir <trusted>
                    │
                    ├─ OS sandbox        writes → project + temp (+ trusted roots)   [HARD WALL]
-                   ├─ guard-bash.py     deny rm -rf / …  · ask sudo/force-push/out-of-cwd
-                   ├─ guard-paths.py    ask on Edit/Write outside the project
+                   ├─ guard-bash.py     deny rm -rf / …  · ask sudo/force-push/rebase-on-protected
+                   ├─ guard-paths.py    out-of-project Edit/Write gate (OFF by default)
                    └─ nudge-tests.py    "you edited code but didn't run tests"
 ```
 
@@ -90,11 +90,20 @@ The policy files live at `~/.claude/harness/sandbox.base.json` and `sandbox.stri
 edit them to taste (add a `denyRead` path, loosen a rule); changes take effect on the next
 `claudex` launch, no reinstall.
 
-## Configure: trusted roots
+## Configure: out-of-project writes (worktrees, siblings)
 
-By default the sandbox only lets bash write to the project + temp, and the hooks `ask`
-before touching anything outside the project. If you work across sibling checkouts / git
-worktrees, list them so they're writable **and** don't prompt:
+Two independent layers govern writes outside the project:
+
+- **The hook location gate is OFF by default** — `guard-paths.py` (Edit/Write) and
+  `guard-bash.py` section 3 no longer prompt when a write/create/delete lands outside the
+  working directory. So git worktrees, sibling dirs, and scaffolding "just work" without an
+  approval prompt. Re-enable the prompt by exporting `HARNESS_GATE_OUTSIDE_WORKDIR=1`.
+- **The OS sandbox still applies** to *bash* subprocesses: it only lets bash write to the
+  project + temp (+ trusted roots). The built-in Edit/Write tools are not sandboxed, so for
+  them the hook gate above is the only location boundary.
+
+To let *bash* write across sibling checkouts / git worktrees under the sandbox, list them as
+trusted roots (this also re-trusts them for the hook gate when it's enabled):
 
 ```bash
 # ~/.claude/harness-trusted-roots.txt  — one path or glob per line
@@ -131,14 +140,14 @@ harmless in normal/ask modes, adding just the catastrophic hard-blocks):
 | Tier | Behavior under bypass | Examples |
 |------|-----------------------|----------|
 | **deny**  | hard block (irreversible) | `rm -rf /` · `~` · `/*`, fork bomb, `dd`/`mkfs`/`>` to a raw device, `chmod -R` on `/` |
-| **ask**   | forces a manual-approval prompt | `sudo`, force-push, `git reset --hard <sha\|HEAD~N>`, `git clean -f`, `commit --no-verify`, `curl\|bash` — **and any write/delete/edit landing outside the project** |
-| **allow** | silent pass-through (full bypass speed) | tests, builds, `git status`, reads, mutations inside the project or `/tmp`, `git reset --hard origin/main` |
+| **ask**   | forces a manual-approval prompt | `sudo`, force-push to a protected/shared branch, `git reset --hard <sha\|HEAD~N>`, `git clean -f`, `git rebase` on a protected branch, `curl\|bash`. *(Writes/deletes/edits outside the project also ask when `HARNESS_GATE_OUTSIDE_WORKDIR=1`; that gate is **off by default**.)* |
+| **allow** | silent pass-through (full bypass speed) | tests, builds, `git status`, reads, `commit --no-verify`, mutations inside the project or `/tmp`, force-push/rebase of a topic branch, out-of-project file writes (gate off), `git reset --hard origin/main` |
 
-- **`guard-bash.py`** — `PreToolUse` on `Bash`. Catastrophic denies, gray-area asks,
-  out-of-project mutation asks.
-- **`guard-paths.py`** — `PreToolUse` on `Edit|Write|MultiEdit|NotebookEdit`. Asks when the
-  target file is outside the project (the sandbox does **not** cover the built-in file
-  tools, so this hook is their boundary even under `claudex`).
+- **`guard-bash.py`** — `PreToolUse` on `Bash`. Catastrophic denies and gray-area asks. The
+  out-of-project write/delete ask (section 3) is **off by default** (`HARNESS_GATE_OUTSIDE_WORKDIR=1` to enable).
+- **`guard-paths.py`** — `PreToolUse` on `Edit|Write|MultiEdit|NotebookEdit`. The
+  out-of-project file gate; **off by default** (`HARNESS_GATE_OUTSIDE_WORKDIR=1` to enable).
+  When on it matters because the sandbox does **not** cover the built-in file tools.
 - **`nudge-tests.py`** — `Stop` hook. If you edited source and no test/check ran after, it
   nudges once (auto-detects `make`/`pytest`/`npm test`/`cargo`/`go test`/`tox`/`gradle`/
   `mvn`). Silent on Q&A / docs-only / already-tested turns; loop-guarded.

@@ -55,6 +55,9 @@ class HookCase(unittest.TestCase):
         # `$TMPDIR/...` expands identically on a Linux runner (where it is often
         # unset) and on a developer's Mac.
         self.env["TMPDIR"] = tempfile.gettempdir()
+        # The out-of-workdir gate is OFF by default; clear any ambient override
+        # so tests are deterministic. Classes that exercise the gate re-set it.
+        self.env.pop("HARNESS_GATE_OUTSIDE_WORKDIR", None)
 
     def tearDown(self):
         import shutil
@@ -544,8 +547,14 @@ class TestScanSkipsData(HookCase):
 
 
 class TestOutsideWorkingDir(HookCase):
-    """Writes/deletes reaching outside the working dir ask; scratch/dev and
-    script-local var overrides do not."""
+    """The out-of-workdir gate WHEN ENABLED (HARNESS_GATE_OUTSIDE_WORKDIR=1):
+    writes/deletes reaching outside the working dir ask; scratch/dev and
+    script-local var overrides do not. (The gate is OFF by default -- see
+    TestOutsideWorkdirGateOff for that behavior.)"""
+
+    def setUp(self):
+        super().setUp()
+        self.env["HARNESS_GATE_OUTSIDE_WORKDIR"] = "1"
 
     def test_mkdir_outside_asks(self):
         self.assertBash("mkdir -p /opt/somewhere-else", "ask")
@@ -590,10 +599,15 @@ class TestCopyReadsSource(HookCase):
     destination. Reads outside the working dir are fine, so an out-of-cwd SOURCE
     must not ask -- only an out-of-cwd DESTINATION does. `mv` still gates its
     source (it removes it). Uses explicit /opt paths for 'outside', since the
-    test's own $HOME is a scratch temp dir."""
+    test's own $HOME is a scratch temp dir. Requires the out-of-workdir gate
+    ENABLED (it is OFF by default)."""
 
     OUT = "/opt/elsewhere"        # outside REAL_CWD and not scratch
     SCR = "$TMPDIR/dst"           # a real scratch destination in the test env
+
+    def setUp(self):
+        super().setUp()
+        self.env["HARNESS_GATE_OUTSIDE_WORKDIR"] = "1"
 
     # --- source outside cwd is a read -> allowed ----------------------------
 
@@ -666,8 +680,13 @@ class TestNormalCommandsAllowed(HookCase):
 
 
 class TestGuardPaths(HookCase):
-    """The file-tool half: Edit/Write outside the working dir ask; inside,
-    scratch, and /tmp allow."""
+    """The file-tool half WHEN ENABLED (HARNESS_GATE_OUTSIDE_WORKDIR=1):
+    Edit/Write outside the working dir ask; inside, scratch, and /tmp allow.
+    (The gate is OFF by default -- see TestOutsideWorkdirGateOff.)"""
+
+    def setUp(self):
+        super().setUp()
+        self.env["HARNESS_GATE_OUTSIDE_WORKDIR"] = "1"
 
     def paths(self, tool, path, cwd=REAL_CWD):
         return self.run_hook(
@@ -695,6 +714,65 @@ class TestGuardPaths(HookCase):
             "guard-paths.py",
             {"tool_name": "Write", "tool_input": {}, "cwd": REAL_CWD})
         self.assertEqual(decision, "allow")
+
+
+class TestOutsideWorkdirGateOff(HookCase):
+    """DEFAULT behavior: the out-of-working-directory FILE gate is OFF, so file
+    writes / creates / deletes / edits anywhere -- git worktrees, sibling dirs,
+    scaffolding -- pass without a prompt. The independent safety layers
+    (catastrophic denies, gray-area asks) still fire. HookCase does NOT set
+    HARNESS_GATE_OUTSIDE_WORKDIR, so these run with the gate off."""
+
+    # --- bash file ops outside cwd -> allowed (no location prompt) -----------
+
+    def test_mkdir_outside_allowed(self):
+        self.assertBash("mkdir -p /opt/somewhere-else", "allow")
+
+    def test_touch_outside_allowed(self):
+        self.assertBash("touch /opt/other/newfile", "allow")
+
+    def test_cp_dest_outside_allowed(self):
+        self.assertBash("cp ./a /opt/other/b", "allow")
+
+    def test_rm_specific_outside_allowed(self):
+        # A targeted (non-whole-tree) delete outside cwd no longer asks.
+        self.assertBash("rm /opt/other/file", "allow")
+
+    def test_redirect_outside_allowed(self):
+        self.assertBash("echo hi > /opt/other/log", "allow")
+
+    def test_worktree_add_allowed(self):
+        self.assertBash("git worktree add ../wt feature", "allow")
+
+    # --- file tools (Edit/Write) outside cwd -> allowed ---------------------
+
+    def test_write_outside_allowed(self):
+        decision, _ = self.run_hook(
+            "guard-paths.py",
+            {"tool_name": "Write", "tool_input": {"file_path": "/opt/elsewhere/c.txt"},
+             "cwd": REAL_CWD})
+        self.assertEqual(decision, "allow")
+
+    def test_edit_outside_allowed(self):
+        decision, _ = self.run_hook(
+            "guard-paths.py",
+            {"tool_name": "Edit", "tool_input": {"file_path": "/opt/elsewhere/x.py"},
+             "cwd": REAL_CWD})
+        self.assertEqual(decision, "allow")
+
+    # --- the other safety layers are unaffected by this gate ----------------
+
+    def test_catastrophic_deny_still_fires(self):
+        self.assertBash("rm -rf /", "deny")
+
+    def test_force_push_still_asks(self):
+        self.assertBash("git push --force origin main", "ask")
+
+    def test_sudo_still_asks(self):
+        self.assertBash("sudo rm x", "ask")
+
+    def test_rebase_protected_still_asks(self):
+        self.assertBash("git checkout main && git rebase origin/main", "ask")
 
 
 class TestNudgeTests(HookCase):
