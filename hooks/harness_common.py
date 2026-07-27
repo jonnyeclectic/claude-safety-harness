@@ -110,9 +110,27 @@ def _match_root(target, raw):
     return target == root or target.startswith(root + os.sep)
 
 
+def outside_workdir_gate_enabled():
+    """Whether the out-of-working-directory FILE gate is active.
+
+    OFF by default: the harness owner relaxed it, so file writes -- creating,
+    overwriting, or editing a file, and the Bash file-mutators/redirects that do
+    the same -- are NOT prompted just for landing outside the working directory.
+    That makes git worktrees, sibling dirs, and scaffolding "just work". Set
+    HARNESS_GATE_OUTSIDE_WORKDIR=1 (or true/yes/on) to re-enable the location
+    prompt. Independent of everything else: catastrophic denies (rm -rf /, mkfs,
+    ...) and gray-area asks (sudo, force-push, curl|bash, rebase on a protected
+    branch) still fire regardless of this setting."""
+    return os.environ.get("HARNESS_GATE_OUTSIDE_WORKDIR", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def is_trusted(target, cwd):
     """True if `target` is inside the working dir, a scratch dir, or a
-    configured trusted root -> the harness should NOT prompt on location."""
+    configured trusted root -> the harness should NOT prompt on location.
+
+    NB: only consulted when outside_workdir_gate_enabled() is True; with the gate
+    off (the default) the guards allow any location without reaching this."""
     target = os.path.realpath(target)
     cwd = os.path.realpath(cwd)
     if target == cwd or target.startswith(cwd + os.sep):

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """PreToolUse guard for file-editing tools under bypassPermissions.
 
-Any Edit/Write/MultiEdit/NotebookEdit whose target file resolves OUTSIDE the
-working directory is deferred to manual approval (ask). Edits inside the workdir
-pass silently, preserving bypass speed. This is the file-tool half of the
+The out-of-working-directory FILE gate: an Edit/Write/MultiEdit/NotebookEdit
+whose target resolves OUTSIDE the working directory is deferred to manual
+approval (ask); edits inside pass silently. This is the file-tool half of the
 "manual approval for interactions outside the working directory" rule; the Bash
-half lives in guard-bash.py.
+half lives in guard-bash.py section 3.
 
-Why this still matters alongside the OS sandbox: the Claude Code sandbox only
-wraps Bash subprocesses — the built-in Read/Edit/Write tools are NOT sandboxed,
-so this hook is the boundary for those tools even under `claudex`.
+This gate is OFF by default (outside_workdir_gate_enabled() -> False): the owner
+relaxed it so file writes anywhere -- git worktrees, sibling dirs, scaffolding --
+pass without a prompt. Set HARNESS_GATE_OUTSIDE_WORKDIR=1 to re-enable it. When
+on, it still matters alongside the OS sandbox: the sandbox only wraps Bash
+subprocesses — the built-in Read/Edit/Write tools are NOT sandboxed, so this
+hook is their only location boundary even under `claudex`.
 """
 import json
 import os
@@ -18,12 +21,16 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from harness_common import is_trusted
+    from harness_common import is_trusted, outside_workdir_gate_enabled
 except Exception:  # degrade to cwd-only if the shared helper is missing
     def is_trusted(target, cwd):
         t, c = os.path.realpath(target), os.path.realpath(cwd)
         return (t == c or t.startswith(c + os.sep)
                 or t.startswith(("/tmp/", "/private/tmp/", "/var/folders/")))
+
+    def outside_workdir_gate_enabled():
+        return os.environ.get("HARNESS_GATE_OUTSIDE_WORKDIR", "").strip().lower() in (
+            "1", "true", "yes", "on")
 
 AUDIT_LOG = os.path.expanduser("~/.claude/harness-audit.log")
 
@@ -69,6 +76,9 @@ if not path:
     sys.exit(0)
 
 target = os.path.realpath(os.path.expanduser(path))
+
+if not outside_workdir_gate_enabled():
+    sys.exit(0)  # out-of-workdir file gate disabled (default) -> allow any location
 
 if is_trusted(target, CWD):
     sys.exit(0)  # inside the workdir / a trusted root / scratch -> allow silently

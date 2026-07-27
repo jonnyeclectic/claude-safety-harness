@@ -10,8 +10,11 @@ claudex. Don't over-invest in the parser; the sandbox is the real boundary.
 
 Decision model (kept deliberately small and auditable):
   deny  -> catastrophic / irreversible. Hard-blocked even under bypass.
-  ask   -> gray-area risky ops, and any WRITE/DELETE reaching outside the
-           working directory. Forces a manual-approval prompt under bypass.
+  ask   -> gray-area risky ops (sudo, force-push, curl|bash, rebase on a
+           protected branch). Also -- only when the out-of-working-directory gate
+           is enabled (HARNESS_GATE_OUTSIDE_WORKDIR=1; OFF by default) -- any
+           WRITE/DELETE reaching outside the working directory. Forces a
+           manual-approval prompt under bypass.
   allow -> silent pass-through (print nothing) so normal bypass speed is kept.
 
 Reads the PreToolUse payload on stdin, emits the Claude Code permission-decision
@@ -27,7 +30,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from harness_common import is_trusted, is_scratch_root
+    from harness_common import (is_trusted, is_scratch_root,
+                                outside_workdir_gate_enabled)
 except Exception:  # degrade to cwd-only if the shared helper is missing
     _SCRATCH_PREFIX = ("/tmp/", "/private/tmp/", "/var/folders/",
                         "/private/var/folders/", "/dev/fd/")
@@ -42,6 +46,10 @@ except Exception:  # degrade to cwd-only if the shared helper is missing
     def is_scratch_root(path):
         p = os.path.realpath(path)
         return p.startswith(_SCRATCH_PREFIX)
+
+    def outside_workdir_gate_enabled():
+        return os.environ.get("HARNESS_GATE_OUTSIDE_WORKDIR", "").strip().lower() in (
+            "1", "true", "yes", "on")
 
 AUDIT_LOG = os.path.expanduser("~/.claude/harness-audit.log")
 
@@ -661,11 +669,15 @@ for _stmt, _stmt_cwd, _stmt_branch in zip(STATEMENTS, STMT_CWDS, STMT_BRANCHES):
              f"of protected branch '{_stmt_branch}'. Command: {CMD}")
 
 # ---- 3. ASK: writes/deletes reaching outside the working directory ----------
-# Heuristic: only gate MUTATING commands and file-creating redirects. Reads
-# (cat/grep/ls) outside cwd pass, to keep the session fast. Relative paths
-# resolve against each statement's own effective cwd (STMT_CWDS, from the
-# walk above) so "./build" after a `cd` stays recognized as inside; absolute/
-# home paths that land outside -> ask for manual approval.
+# OFF by default (outside_workdir_gate_enabled() -> False): the owner relaxed the
+# location gate so file writes/creates/deletes anywhere -- git worktrees, sibling
+# dirs, scaffolding -- pass without a prompt. Set HARNESS_GATE_OUTSIDE_WORKDIR=1
+# to re-enable. When on: only MUTATING commands and file-creating redirects are
+# gated; reads (cat/grep/ls) outside cwd pass, to keep the session fast. Relative
+# paths resolve against each statement's own effective cwd (STMT_CWDS, from the
+# walk above) so "./build" after a `cd` stays recognized as inside; absolute/home
+# paths that land outside -> ask for manual approval. (Catastrophic denies in
+# section 1 and the gray-area asks in section 2 fire regardless of this gate.)
 MUTATORS = ("rm", "rmdir", "mv", "cp", "install", "tee", "truncate",
             "mkdir", "touch", "ln", "chmod", "chown", "dd")
 
@@ -739,37 +751,39 @@ def write_targets(cmd_word, tokens):
     return positional[-1:]  # the destination only (empty if no operands)
 
 
-for stmt, stmt_cwd in zip(STATEMENTS, STMT_CWDS):
-    # file-creating redirects (> / >>) whose target is outside this
-    # statement's effective cwd
-    for rt in redirect_targets(stmt):
-        if rt.startswith("&") or rt == "/dev/null":
-            continue
-        tgt = outside_cwd(rt, stmt_cwd)
-        if tgt:
-            emit("ask",
-                 f"Harness: redirect writes outside the working directory "
-                 f"({rt} -> {tgt}); approve manually. Command: {CMD}")
+if outside_workdir_gate_enabled():
+    for stmt, stmt_cwd in zip(STATEMENTS, STMT_CWDS):
+        # file-creating redirects (> / >>) whose target is outside this
+        # statement's effective cwd
+        for rt in redirect_targets(stmt):
+            if rt.startswith("&") or rt == "/dev/null":
+                continue
+            tgt = outside_cwd(rt, stmt_cwd)
+            if tgt:
+                emit("ask",
+                     f"Harness: redirect writes outside the working directory "
+                     f"({rt} -> {tgt}); approve manually. Command: {CMD}")
 
-    # mutating command whose OWN target path is outside this statement's
-    # effective cwd
-    try:
-        tokens = shlex.split(stmt)
-    except ValueError:
-        tokens = stmt.split()
-    if not tokens:
-        continue
-    cmd_word = os.path.basename(tokens[0])
-    if cmd_word not in MUTATORS:
-        continue
-    for tok in write_targets(cmd_word, tokens):
-        if tok.startswith("-") or ("/" not in tok and not tok.startswith(("~", "$"))):
+        # mutating command whose OWN target path is outside this statement's
+        # effective cwd
+        try:
+            tokens = shlex.split(stmt)
+        except ValueError:
+            tokens = stmt.split()
+        if not tokens:
             continue
-        tgt = outside_cwd(tok, stmt_cwd)
-        if tgt:
-            emit("ask",
-                 f"Harness: {cmd_word} writes to a path outside the working "
-                 f"directory ({tok} -> {tgt}); approve manually. Command: {CMD}")
+        cmd_word = os.path.basename(tokens[0])
+        if cmd_word not in MUTATORS:
+            continue
+        for tok in write_targets(cmd_word, tokens):
+            if tok.startswith("-") or ("/" not in tok
+                                       and not tok.startswith(("~", "$"))):
+                continue
+            tgt = outside_cwd(tok, stmt_cwd)
+            if tgt:
+                emit("ask",
+                     f"Harness: {cmd_word} writes to a path outside the working "
+                     f"directory ({tok} -> {tgt}); approve manually. Command: {CMD}")
 
 # ---- default: allow ---------------------------------------------------------
 sys.exit(0)
