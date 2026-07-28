@@ -69,5 +69,5 @@ fi
 # Run as a child (not exec) so the temp settings dir is cleaned up on exit.
 claude --dangerously-skip-permissions \
        --settings "$settings_file" \
-       "${add_dirs[@]}" \
-       "${pass_args[@]}"
+       "${add_dirs[@]+"${add_dirs[@]}"}" \
+       "${pass_args[@]+"${pass_args[@]}"}"
