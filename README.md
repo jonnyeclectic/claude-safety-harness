@@ -86,6 +86,36 @@ Use plain `claudex` for everyday work where the agent needs to install deps or h
 switch to `--strict` when you don't trust the task or the repo (untrusted PRs, random
 `npm`-heavy code) and want it walled off from the network and your credentials.
 
+## Auth context (API keys, Bedrock/Vertex)
+
+`claudex` forwards the auth context you set in your shell — `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_USE_BEDROCK`,
+`CLAUDE_CODE_USE_VERTEX` — through to `claude`, and prints which source won:
+
+```
+claudex: auth → env (ANTHROPIC_API_KEY)
+claudex: auth → cached login (no auth env set)
+```
+
+This matters because some terminals put their own shim in front of `claude` and
+**scrub those variables on the way through** (cmux unsets them so a new pane can't
+inherit a stale key). Launched from such a terminal, `claudex` used to hand `claude`
+an environment with your key removed, and the session silently fell back to whatever
+credentials were cached on disk — a wrong-account run, or a 401 with nothing on screen
+explaining why. `claudex` now opts into the wrapper's preserve hatch whenever you
+actually set auth context. Export `CLAUDEX_NO_AUTH_PASSTHROUGH=1` to defer to the
+wrapper's scrub instead.
+
+Two things this deliberately does *not* change:
+
+- **`--strict` still scrubs `ANTHROPIC_API_KEY` from bash subprocesses.** Your own
+  session authenticates fine; a nested `claude -p` inside sandboxed bash does not (and
+  couldn't reach the API anyway under the strict network block). That's the point.
+- **An API key in the wrong variable is still an error** — `claudex` just names it now.
+  `CLAUDE_CODE_OAUTH_TOKEN` takes an OAuth token (`sk-ant-oat01-…`); an `sk-ant-api03-…`
+  key there authenticates *at launch* and then 401s mid-session, so `claudex` warns.
+
 The policy files live at `~/.claude/harness/sandbox.base.json` and `sandbox.strict.json` —
 edit them to taste (add a `denyRead` path, loosen a rule); changes take effect on the next
 `claudex` launch, no reinstall.

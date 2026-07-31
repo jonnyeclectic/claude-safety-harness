@@ -59,12 +59,53 @@ while IFS= read -r d; do
   [ -n "$d" ] && add_dirs+=(--add-dir "$d")
 done < <(python3 "$compose" "$template" "$roots_arg" "$settings_file")
 
+# --- keep the caller's Anthropic auth context reaching `claude` -------------
+# Terminal integrations put their own shim in front of `claude`, and some of
+# them scrub auth on the way through: cmux, for one, unsets ANTHROPIC_API_KEY,
+# ANTHROPIC_MODEL and the Bedrock/Vertex selectors before exec'ing the real
+# CLI so a fresh pane can't inherit a stale key. Launched from such a terminal
+# claudex would hand `claude` an environment with the auth the user set
+# stripped back out, and the session would quietly fall back to whatever
+# credentials are cached on disk — a wrong-account run or a 401 with nothing
+# on screen explaining why. So: if the caller actually set auth context, opt
+# into the wrapper's documented preserve hatch, and always say out loud which
+# source won. CLAUDEX_NO_AUTH_PASSTHROUGH=1 defers to the wrapper's scrub.
+auth_env_set=""
+for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
+         CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+         ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_BASE_URL; do
+  if [ -n "${!v:-}" ]; then
+    auth_env_set="${auth_env_set:+$auth_env_set }$v"
+  fi
+done
+
+if [ -n "$auth_env_set" ]; then
+  auth_source="env ($auth_env_set)"
+  if [ "${CLAUDEX_NO_AUTH_PASSTHROUGH:-0}" != "1" ]; then
+    export CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV=1
+  fi
+else
+  auth_source="cached login (no auth env set)"
+fi
+
+# An sk-ant-api03- value in CLAUDE_CODE_OAUTH_TOKEN is the one auth mistake
+# that fails *after* a successful launch, as a bare 401 mid-session: the var
+# takes an OAuth token (sk-ant-oat01-), and an API key belongs in
+# ANTHROPIC_API_KEY. Cheap to spot here, expensive to debug from the error.
+case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in
+  sk-ant-api03-*)
+    echo "claudex: warning: CLAUDE_CODE_OAUTH_TOKEN holds an sk-ant-api03- API key, not an" >&2
+    echo "        OAuth token (sk-ant-oat01-). Claude will 401. Put API keys in ANTHROPIC_API_KEY." >&2
+    ;;
+esac
+
 # --- announce the active profile (to stderr, so -p stdout stays clean) ------
 if [ "$strict" -eq 1 ]; then
   echo "claudex: STRICT — sandbox on; subprocess network DISABLED; secrets hidden; writes → project+temp." >&2
 else
   echo "claudex: sandbox on; writes → project+temp (+trusted roots); network open. Use --strict to lock down." >&2
 fi
+echo "claudex: auth → $auth_source" >&2
 
 # Run as a child (not exec) so the temp settings dir is cleaned up on exit.
 claude --dangerously-skip-permissions \
