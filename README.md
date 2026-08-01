@@ -185,6 +185,63 @@ harmless in normal/ask modes, adding just the catastrophic hard-blocks):
 Every `deny`/`ask` is logged to `~/.claude/harness-audit.log` (JSONL) so you can tune the
 regex lists in `guard-bash.py` (`DENY_RULES`, `GRAY_RULES`) from real usage.
 
+## `gh` doesn't work in the sandbox — use `ghapi`
+
+Every `gh` network call fails inside the sandbox, and the error blames the wrong thing:
+
+```
+$ gh auth status
+X Failed to log in to github.com using token (GITHUB_TOKEN)
+  - The token in GITHUB_TOKEN is invalid.
+```
+
+The token is fine. `GH_DEBUG=api gh api user` shows the real error:
+
+```
+tls: failed to verify certificate: x509: OSStatus -26276   # errSecInternalComponent
+```
+
+Go verifies TLS certificates on macOS by calling the Security framework, which reaches
+`trustd` over XPC — a mach lookup Seatbelt denies. So `gh` cannot complete *any* HTTPS
+request here, and no wrapper can rescue it. Nothing about this is `gh`-specific — it's in
+Go's standard TLS path — so expect other Go CLIs that verify certs in-process to fail the
+same way (only `gh` has been observed doing so here). `SSL_CERT_FILE` and
+`GODEBUG=x509usefallbackroots=1` do **not** help — Go always uses the platform verifier
+when `RootCAs` is nil.
+
+`curl` and `python` are unaffected: they verify against OpenSSL's own CA bundle in-process
+and never talk to `trustd`. `bin/ghapi` (installed to `~/.local/bin/ghapi`) is a
+`gh api`-compatible client built on curl:
+
+```bash
+ghapi auth status                      # the check `gh auth status` gets wrong
+ghapi user --jq .login
+ghapi user -i                          # include response headers (scopes, rate limit)
+ghapi repos/{owner}/{repo}/pulls --paginate --jq '.[].title'
+ghapi -X POST repos/{owner}/{repo}/pulls \
+  -f title='Fix the thing' -f head=my-branch -f base=main -f body='...'
+ghapi graphql -f query='{viewer{login}}'
+```
+
+`{owner}`/`{repo}` resolve from the `origin` remote, `-f`/`-F`/`-H`/`-i`/`--paginate`/
+`--jq` behave as in `gh api`, and the token is passed via a curl `--config` file so it
+never appears in `ps`. Other than `auth status`, the non-api subcommands (`gh pr create`,
+`gh run watch`) are not reimplemented — use the REST endpoints directly.
+
+`git` over HTTPS works normally (it uses curl), so ordinary fetch/push/PR flows are fine.
+
+Under `claudex --strict` this is expected to fail, and that isn't a bug: strict mode denies
+`GITHUB_TOKEN`/`GH_TOKEN` and blocks subprocess network entirely. Use plain `claudex` when
+the task legitimately needs the GitHub API.
+
+Two related gotchas when writing your own helpers:
+
+- **Don't use Python's `urllib` as the transport.** Its TLS works, but responses over
+  ~5KB come back truncated (`IncompleteRead`, at a different offset each run) because the
+  sandbox's HTTP/1.1 proxy hangs up early. curl negotiates HTTP/2 and returns the full
+  body every time.
+- **`/tmp` is not writable** inside the sandbox — use `$TMPDIR`.
+
 ## Limitations (know what this does and doesn't stop)
 
 - The sandbox wraps **bash subprocesses**, not the built-in `Read`/`Edit`/`Write` tools —
