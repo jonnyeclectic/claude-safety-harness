@@ -109,6 +109,11 @@ mkdir -p "$BIN_DIR"
 cp "$REPO_DIR/bin/claudex" "$BIN_DIR/claudex"
 chmod +x "$BIN_DIR/claudex"
 ok "Launcher → $BIN_DIR/claudex"
+# `gh` cannot make HTTPS requests inside the sandbox (Go's TLS verifier needs
+# trustd over XPC, which Seatbelt denies), so ship a curl-based stand-in.
+cp "$REPO_DIR/bin/ghapi" "$BIN_DIR/ghapi"
+chmod +x "$BIN_DIR/ghapi"
+ok "GitHub API client → $BIN_DIR/ghapi (use instead of 'gh api' in a sandbox)"
 case ":$PATH:" in
   *":$BIN_DIR:"*) : ;;
   *) warn "$BIN_DIR is not on your PATH — add it, e.g.: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;

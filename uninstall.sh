@@ -30,8 +30,9 @@ if [ "${1:-}" = "--managed-allowlist" ]; then
   exit 0
 fi
 
-# Launcher
+# Launcher + sandbox-safe GitHub client
 if [ -e "$BIN_DIR/claudex" ]; then rm -f "$BIN_DIR/claudex"; ok "Removed $BIN_DIR/claudex"; fi
+if [ -e "$BIN_DIR/ghapi" ]; then rm -f "$BIN_DIR/ghapi"; ok "Removed $BIN_DIR/ghapi"; fi
 
 # Policy files
 for f in sandbox.base.json sandbox.strict.json compose-settings.py; do
