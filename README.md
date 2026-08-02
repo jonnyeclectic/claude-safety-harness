@@ -234,13 +234,31 @@ Under `claudex --strict` this is expected to fail, and that isn't a bug: strict 
 `GITHUB_TOKEN`/`GH_TOKEN` and blocks subprocess network entirely. Use plain `claudex` when
 the task legitimately needs the GitHub API.
 
-Two related gotchas when writing your own helpers:
+## Sandbox gotchas (things that fail in confusing ways)
 
-- **Don't use Python's `urllib` as the transport.** Its TLS works, but responses over
+Each of these has a trivial workaround; the cost is the time spent misdiagnosing them.
+They all follow from the sandbox doing its job, and none indicate a broken install.
+
+- **`gh` reports a TLS failure as an invalid token** — see the section above. The token
+  is fine.
+- **Don't use Python's `urllib` as an HTTP transport.** Its TLS works, but responses over
   ~5KB come back truncated (`IncompleteRead`, at a different offset each run) because the
   sandbox's HTTP/1.1 proxy hangs up early. curl negotiates HTTP/2 and returns the full
   body every time.
-- **`/tmp` is not writable** inside the sandbox — use `$TMPDIR`.
+- **`/tmp` is not writable** — use `$TMPDIR`.
+- **`/dev/stdout` cannot be opened**, so `open('/dev/stdout','w')` fails with `EPERM`.
+  Writing to the already-open `sys.stdout` works; only the device path is blocked.
+- **`git push -u` fails** with `could not lock config file .git/config`. The push itself
+  succeeds — only the upstream-tracking write is denied, so name the remote and branch
+  explicitly. Likewise `failed to store: 100001` is the keychain credential helper being
+  unable to cache; it is noise, not a failure.
+- **`make lint` needs `PYTHONPYCACHEPREFIX`** (already set in the Makefile). `compileall`
+  writes `hooks/__pycache__` by default, and the sandbox denies writes to `hooks/` so the
+  agent can't rewrite its own guards.
+- **`install.sh` refuses to run inside a sandboxed session** — it probes `~/.claude` for
+  writability and exits early. Run it from a normal terminal; the `!` prefix won't do.
+  Note it *copies* rather than symlinks, so editing `bin/ghapi` in the repo does not
+  change the installed copy until you reinstall.
 
 ## Limitations (know what this does and doesn't stop)
 

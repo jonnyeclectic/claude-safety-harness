@@ -1,6 +1,7 @@
 # Local user config / runtime — never ship these
 harness-trusted-roots.txt
 harness-audit.log
+even-terminal-*.log
 __pycache__/
 *.pyc
 .DS_Store
