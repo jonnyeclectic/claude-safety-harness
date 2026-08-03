@@ -12,7 +12,7 @@ Two layers:
   exactly as Claude Code invokes them;
 * harness_common.py is imported and unit-tested directly.
 
-Every subprocess runs with a fresh temp ``$HOME`` (so the machine's real
+Every subprocess runs with a synthetic ``$HOME`` (so the machine's real
 ~/.claude/harness-trusted-roots.txt and audit log never leak into a result)
 and a controlled ``$TMPDIR``. Assertions are on the *decision* (allow/ask/deny),
 never on resolved path strings, so macOS (/tmp -> /private/tmp) and Linux agree.
@@ -38,19 +38,32 @@ import harness_common  # noqa: E402
 # (both /tmp/ and /private/tmp/ are trusted prefixes). It need not exist —
 # the guards resolve paths lexically, never stat them.
 SCRATCH_CWD = "/tmp/claude-harness-tests/loop"
-# A directory guaranteed NOT to be scratch and (under a temp HOME) not a
-# configured trusted root either.
+# A directory guaranteed NOT to be scratch and (under the synthetic HOME below)
+# not a configured trusted root either.
 REAL_CWD = "/opt/harness-tests/project"
+# The ambient $HOME hooks run under by default. Deliberately NOT a temp dir: a
+# temp $HOME is itself a throwaway home, which (correctly) relaxes the whole-home
+# `rm -rf` deny -- so running every test under one would quietly stop the
+# real-home denies from being exercised at all. A sibling of REAL_CWD, not a
+# parent, so it is never trusted as "inside the working directory". It need not
+# exist: the guards resolve paths lexically, and the hook's own reads under
+# ~/.claude (trusted roots, audit log) fail closed to "nothing configured",
+# which is the same isolation the temp home gave.
+REAL_HOME = "/opt/harness-tests/home"
 
 
 class HookCase(unittest.TestCase):
     """Base: run a hook as a subprocess under a clean, controlled environment."""
 
     def setUp(self):
+        # A real writable temp dir for tests that need to PUT something in a home
+        # (nudge-tests' transcript); $HOME itself points at REAL_HOME so the
+        # machine's real ~/.claude never leaks in and `~` still reads as a real,
+        # non-throwaway home. TestTempHomeRm re-points $HOME here on purpose.
         self.home = tempfile.mkdtemp(prefix="harness-home-")
         os.makedirs(os.path.join(self.home, ".claude"), exist_ok=True)
         self.env = dict(os.environ)
-        self.env["HOME"] = self.home
+        self.env["HOME"] = REAL_HOME
         # Guarantee $TMPDIR is defined and points at a real scratch root, so
         # `$TMPDIR/...` expands identically on a Linux runner (where it is often
         # unset) and on a developer's Mac.
@@ -124,6 +137,101 @@ class TestCatastrophicDeny(HookCase):
         self.assertBash("rm -rf ~", "deny", cwd=SCRATCH_CWD)
 
 
+class TestQuotedCatastrophicTargets(HookCase):
+    """A quoted target must be caught exactly like a bare one.
+
+    Regression: the catastrophic rules matched only the UNQUOTED spelling, so
+    `rm -rf "/"`, `rm -rf "$HOME"` and `bash -c "rm -rf /"` -- the way these are
+    usually written -- were all silently ALLOWED. Two things fixed it: code_only
+    now keeps the quoted operands of path-target commands (_TARGET_CMDS) instead
+    of blanking them as data, and the rules match against a scan text with the
+    quote marks stripped, so every spelling normalizes to one bare form.
+
+    The paired must-NOT-deny cases matter as much: a quote mark is not an
+    end-of-target marker, so a path quoted in pieces (`"$HOME"/.cache/foo`) is
+    still just a specific subpath."""
+
+    RMRF = "r" + "m -rf"
+
+    # --- quoted whole-tree targets -> deny -----------------------------------
+
+    def test_quoted_root(self):
+        self.assertBash('%s "/"' % self.RMRF, "deny")
+
+    def test_single_quoted_root(self):
+        self.assertBash("%s '/'" % self.RMRF, "deny")
+
+    def test_quoted_root_wildcard(self):
+        self.assertBash('%s "/"*' % self.RMRF, "deny")
+
+    def test_quoted_home(self):
+        self.assertBash('%s "$HOME"' % self.RMRF, "deny")
+
+    def test_quoted_braced_home(self):
+        self.assertBash('%s "${HOME}"' % self.RMRF, "deny")
+
+    def test_quoted_home_trailing_slash(self):
+        self.assertBash('%s "$HOME"/' % self.RMRF, "deny")
+
+    def test_flags_reversed_quoted_home(self):
+        self.assertBash('r%s "$HOME"' % "m -fr", "deny")
+
+    def test_interpreter_double_quoted_root(self):
+        self.assertBash('bash -c "%s /"' % self.RMRF, "deny")
+
+    def test_interpreter_single_quoted_root(self):
+        self.assertBash("bash -c '%s /'" % self.RMRF, "deny")
+
+    def test_interpreter_later_statement_root(self):
+        self.assertBash('sh -c "%s /tmp/x; %s /"' % (self.RMRF, self.RMRF), "deny")
+
+    def test_quoted_chmod_root(self):
+        self.assertBash('chmod -R 777 "/"', "deny")
+
+    def test_quoted_dd_raw_device(self):
+        self.assertBash('dd if=/dev/zero of="/dev/disk2"', "deny")
+
+    def test_quoted_redirect_raw_device(self):
+        # The redirect target is a path the shell writes to whatever the command
+        # is, so it is checked on the parsed statement, not the scan text.
+        self.assertBash('echo x > "/dev/rdisk0"', "deny")
+
+    # --- must NOT over-deny: a quote is not an end-of-target marker ----------
+
+    def test_piecewise_quoted_subpath_allowed(self):
+        # The closing quote is mid-path; this deletes one cache dir, not a home.
+        self.assertBash('%s "$HOME"/.cache/foo' % self.RMRF, "allow")
+
+    def test_quoted_subpath_allowed(self):
+        self.assertBash('%s "$HOME/.cache/pip"' % self.RMRF, "allow")
+
+    def test_quoted_subpath_with_space_allowed(self):
+        self.assertBash('%s "$HOME/My Documents/tmp"' % self.RMRF, "allow")
+
+    def test_quoted_specific_dir_allowed(self):
+        self.assertBash('%s "my dir/sub"' % self.RMRF, "allow")
+
+    def test_other_var_allowed(self):
+        self.assertBash('%s "${BUILD_DIR}"' % self.RMRF, "allow")
+
+    def test_rm_in_commit_message_allowed(self):
+        # `git` is not a path-target command, so its quoted arg stays data.
+        self.assertBash('git commit -m "%s / was a typo"' % self.RMRF, "allow")
+
+    def test_rm_in_grep_pattern_allowed(self):
+        self.assertBash('grep -r "%s /" .' % self.RMRF, "allow")
+
+    def test_docker_rm_flag_with_home_mount_allowed(self):
+        # `--rm` is a flag, not the rm command.
+        self.assertBash('docker run --rm -v "$HOME:/data" img', "allow")
+
+    def test_device_path_in_message_allowed(self):
+        self.assertBash('echo "writes > /dev/rdisk0 are bad"', "allow")
+
+    def test_quoted_redirect_to_normal_file_allowed(self):
+        self.assertBash('echo hi > "/tmp/out.log"', "allow")
+
+
 class TestDenyInsideSubstitution(HookCase):
     """A catastrophic command run via command substitution or a subshell is
     executed even inside double quotes, so it must still be DENIED. code_only()
@@ -169,9 +277,10 @@ class TestReassignedHomeRm(HookCase):
     """`rm -rf $HOME`/`~` after the command line ITSELF reassigned HOME to a
     scratch/trusted path deletes that throwaway dir, not the user's real home --
     the standard `export HOME="$TMPDIR/x" && rm -rf "$HOME"` test-isolation
-    idiom. It must be allowed. An AMBIENT (un-reassigned) home, a literal root,
-    an rm hidden in a substitution, or a reassignment to a non-scratch place must
-    all still DENY -- a HOME export never launders those."""
+    idiom. It must be allowed. An AMBIENT REAL home (un-reassigned, and not itself
+    a temp dir -- see TestTempHomeRm for that case), a literal root, an rm hidden
+    in a substitution, or a reassignment to a non-scratch place must all still
+    DENY -- a HOME export never launders those."""
 
     RMRF = "r" + "m -rf"          # command + flags; target is appended per case
     TH = "$TMPDIR/deptest-home"   # $TMPDIR is a real scratch root in the test env
@@ -198,6 +307,10 @@ class TestReassignedHomeRm(HookCase):
         self.assertBash('export HOME=%s && %s $HOME/*' % (self.TH, self.RMRF),
                         "allow")
 
+    def test_reassign_quoted_home_trailing_slash(self):
+        self.assertBash('export HOME="%s" && %s "$HOME"/' % (self.TH, self.RMRF),
+                        "allow")
+
     def test_reassign_into_cwd_allowed(self):
         # HOME reassigned to a dir INSIDE the working directory -> trusted.
         self.assertBash('export HOME=%s/h && %s $HOME' % (REAL_CWD, self.RMRF),
@@ -212,6 +325,7 @@ class TestReassignedHomeRm(HookCase):
     # --- must STILL deny ----------------------------------------------------
 
     def test_ambient_home_var_still_denies(self):
+        # HookCase runs under REAL_HOME, so this is a genuine whole-home wipe.
         self.assertBash('%s $HOME' % self.RMRF, "deny")
 
     def test_ambient_tilde_still_denies(self):
@@ -235,6 +349,77 @@ class TestReassignedHomeRm(HookCase):
         # inspect), so even with a HOME export the catastrophic deny stands.
         self.assertBash('export HOME=%s && echo "$(%s /)"' % (self.TH, self.RMRF),
                         "deny")
+
+
+class TestTempHomeRm(HookCase):
+    """`rm -rf $HOME`/`~` when the AMBIENT $HOME is ALREADY a temp dir.
+
+    The in-line `export HOME=...` rescue above only covers a home retargeted on
+    the same command line. A session can just as well START under a throwaway
+    home -- test isolation, CI, a container, a sandboxed run -- and then `~`
+    means $TMPDIR/... for every command, with no export to see. Wiping it is the
+    same non-event, so it must not hit the catastrophic deny either.
+
+    The temp home is a relaxation of the HOME target only: a literal root wipe,
+    a root wildcard, and an rm hidden in a substitution all still DENY."""
+
+    RMRF = "r" + "m -rf"
+
+    def setUp(self):
+        super().setUp()
+        self.env["HOME"] = self.home  # mkdtemp -> a genuine OS temp dir
+
+    # --- ambient temp home -> allowed ---------------------------------------
+
+    def test_ambient_temp_home_var(self):
+        self.assertBash("%s $HOME" % self.RMRF, "allow")
+
+    def test_ambient_temp_home_var_quoted(self):
+        self.assertBash('%s "$HOME"' % self.RMRF, "allow")
+
+    def test_ambient_temp_home_braced(self):
+        self.assertBash('%s "${HOME}"' % self.RMRF, "allow")
+
+    def test_ambient_temp_home_tilde(self):
+        self.assertBash("%s ~" % self.RMRF, "allow")
+
+    def test_ambient_temp_home_trailing_slash(self):
+        self.assertBash("%s $HOME/" % self.RMRF, "allow")
+
+    def test_ambient_temp_home_wildcard(self):
+        self.assertBash("%s $HOME/*" % self.RMRF, "allow")
+
+    def test_ambient_temp_home_quoted_trailing_slash(self):
+        # `"$HOME"/` is ONE shell word; a tokenizer that breaks at the closing
+        # quote sees a bare `/` and reads a root wipe that was never written.
+        self.assertBash('%s "$HOME"/' % self.RMRF, "allow")
+
+    def test_ambient_temp_home_quoted_wildcard(self):
+        self.assertBash('%s "$HOME"/*' % self.RMRF, "allow")
+
+    def test_wipe_and_recreate_idiom(self):
+        self.assertBash('%s "$HOME" && mkdir -p "$HOME"' % self.RMRF, "allow")
+
+    # --- must STILL deny ----------------------------------------------------
+
+    def test_root_still_denies(self):
+        # A temp home never launders a literal-root wipe.
+        self.assertBash("%s /" % self.RMRF, "deny")
+
+    def test_root_wildcard_still_denies(self):
+        self.assertBash("%s /*" % self.RMRF, "deny")
+
+    def test_rm_in_substitution_still_denies(self):
+        self.assertBash('echo "$(%s /)"' % self.RMRF, "deny")
+
+    def test_reassign_away_from_temp_still_denies(self):
+        # The line re-exports HOME to a real dir and wipes THAT: the ambient temp
+        # home is irrelevant, the target is what counts.
+        self.assertBash('export HOME=/opt/not-scratch && %s "$HOME"' % self.RMRF,
+                        "deny")
+
+    def test_no_preserve_root_still_denies(self):
+        self.assertBash("%s --no-preserve-root /some" % self.RMRF, "deny")
 
 
 class TestGrayGlobalAsk(HookCase):
@@ -598,8 +783,9 @@ class TestCopyReadsSource(HookCase):
     """`cp`/`install`/`ln` READ their leading operand(s) and WRITE only the
     destination. Reads outside the working dir are fine, so an out-of-cwd SOURCE
     must not ask -- only an out-of-cwd DESTINATION does. `mv` still gates its
-    source (it removes it). Uses explicit /opt paths for 'outside', since the
-    test's own $HOME is a scratch temp dir. Requires the out-of-workdir gate
+    source (it removes it). 'Outside' is /opt (and REAL_HOME, which lives there
+    too), never a temp path, so the cases turn on the copy-source rule rather
+    than on scratch being trusted anyway. Requires the out-of-workdir gate
     ENABLED (it is OFF by default)."""
 
     OUT = "/opt/elsewhere"        # outside REAL_CWD and not scratch
@@ -929,6 +1115,25 @@ class TestHarnessCommon(unittest.TestCase):
     def test_is_scratch_root_false_for_home(self):
         self.assertFalse(harness_common.is_scratch_root(os.path.expanduser("~")))
 
+    # is_temp_path: the stricter "genuinely throwaway" boundary used to decide
+    # whether a whole-home rm is wiping a real home.
+
+    def test_is_temp_path_true_for_tmp(self):
+        self.assertTrue(harness_common.is_temp_path("/tmp/fake-home"))
+
+    def test_is_temp_path_true_for_tmpdir(self):
+        self.assertTrue(harness_common.is_temp_path(
+            os.path.join(tempfile.gettempdir(), "fake-home")))
+
+    def test_is_temp_path_true_for_temp_root_itself(self):
+        self.assertTrue(harness_common.is_temp_path("/tmp"))
+
+    def test_is_temp_path_false_for_real_dir(self):
+        self.assertFalse(harness_common.is_temp_path("/opt/harness-tests/home"))
+
+    def test_is_temp_path_false_for_home(self):
+        self.assertFalse(harness_common.is_temp_path(os.path.expanduser("~")))
+
 
 class TestTrustedRoots(unittest.TestCase):
     """The configurable escape hatch: ~/.claude/harness-trusted-roots.txt.
@@ -960,6 +1165,16 @@ class TestTrustedRoots(unittest.TestCase):
         self._write("# a comment", "", root)
         self.assertTrue(harness_common.is_trusted(root + "/repo/file", "/x/proj"))
         self.assertTrue(harness_common.is_scratch_root(root + "/repo"))
+
+    def test_trusted_root_is_not_a_temp_path(self):
+        # The is_scratch_root / is_temp_path split: a trusted root is disposable
+        # enough to skip a history-rewrite prompt, but it is a place the owner
+        # KEEPS things -- so a $HOME living there is a real home and `rm -rf ~`
+        # on it stays denied.
+        root = self.BASE + "/workspace"
+        self._write(root)
+        self.assertTrue(harness_common.is_scratch_root(root + "/home"))
+        self.assertFalse(harness_common.is_temp_path(root + "/home"))
 
     def test_unlisted_dir_not_trusted(self):
         self._write(self.BASE + "/workspace")
