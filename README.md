@@ -146,6 +146,34 @@ subprocess writes there aren't blocked) **and** `--add-dir` (so the built-in fil
 reach them). The file is re-read on every launch; the current project dir is always
 trusted automatically, so you only list *siblings*.
 
+### What trusted roots can't reach
+
+Claude Code hard-denies bash writes to **its own configuration surface**, and that deny beats
+`allowWrite` — listing one of these as a trusted root silently does nothing at the kernel
+level:
+
+```
+~/.claude/{skills,hooks,agents,commands,workflows,routines,rules,output-styles,
+           plugins,local,jobs,daemon,shell-snapshots,session-env,backups,projects}
+~/.claude/{settings.json,CLAUDE.md,scheduled_tasks.json,launch.json,loop.md}
+<project>/.claude/{settings.json,settings.local.json,skills,hooks}
+```
+
+Keep it that way. A file under `~/.claude/skills` is *instructions that load into Claude's
+context*, so a writable skills dir turns any hijacked bash subprocess — or a prompt injection
+driving one — into a way to author its own instructions for your next session. This is the
+one hole the harness most wants shut. Tools that install into those dirs (skill managers,
+plugin installers) need to run from a normal terminal, not from inside `claudex`.
+
+Two exceptions are *not* denied and do work as trusted roots: `~/.claude/plans` and
+`~/.claude/projects/*/memory` — both are Claude Code output, not configuration.
+
+One consequence worth knowing: `~/.claude/session-env` is on the deny list, so a **nested
+`claude` cannot start** inside a `claudex` session — it exits with
+`EPERM … mkdir '~/.claude/session-env/<uuid>'`. You therefore can't test a candidate sandbox
+profile with `claude -p --settings <candidate>` from inside a sandboxed session; verify
+profile changes after a real relaunch instead.
+
 ## Optional: a true global network allow-list
 
 `claudex --strict` blocks **all** subprocess network. If instead you want an *allow-list*

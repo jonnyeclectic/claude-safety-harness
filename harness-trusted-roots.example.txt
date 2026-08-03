@@ -16,6 +16,15 @@
 #   ask   -> sudo, force-push, git reset --hard <sha|HEAD~N>, curl|bash
 #
 # Globs allowed: * ? []    e.g. ~/work-*  matches ~/work-loop, ~/work-tilde
+#
+# WON'T WORK: Claude Code hard-denies bash writes to its own config surface
+# (~/.claude/skills, hooks, agents, commands, plugins, settings.json, ... and a
+# project's .claude/ equivalents) and that deny beats allowWrite, so listing one
+# here does nothing at the kernel level. Deliberate: a skills dir you can write
+# is a way for a hijacked subprocess to author instructions for your next
+# session. Run skill/plugin installers from a normal terminal instead.
+# ~/.claude/plans and ~/.claude/projects/*/memory are output, not config, and DO
+# work as trusted roots. See "What trusted roots can't reach" in the README.
 
 # --- examples (delete and replace with your own) ---
 # ~/myproject
