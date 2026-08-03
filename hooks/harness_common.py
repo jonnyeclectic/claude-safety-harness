@@ -146,6 +146,21 @@ def is_trusted(target, cwd):
     return any(_match_root(target, raw) for raw in load_trusted_roots())
 
 
+def is_temp_path(path):
+    """True if `path` sits in (or IS) an OS temp root -- /tmp, /private/tmp,
+    /var/folders, $TMPDIR, ... -- i.e. a genuinely throwaway location the OS
+    itself reclaims.
+
+    Strictly narrower than is_scratch_root(): configured trusted roots do NOT
+    count. Used for the one decision where "disposable" has to mean literally
+    temporary rather than "the owner declared this location fine to write in":
+    relaxing guard-bash's whole-home `rm -rf` deny when $HOME is a throwaway
+    home. A trusted root is a place you keep things; a temp dir is not, and
+    only the latter makes wiping an entire home tree a non-event."""
+    path = os.path.realpath(path)
+    return path.startswith(_SCRATCH) or any(path == p[:-1] for p in _SCRATCH)
+
+
 def is_scratch_root(path):
     """True if `path` ITSELF (no separate cwd to compare against) sits inside
     a scratch/tmp root or a configured trusted root.
@@ -158,7 +173,7 @@ def is_scratch_root(path):
     guard-bash's gray-area asks (rebase, reset --hard, clean -f, commit
     --no-verify, filter-branch) for loop/remediation clones under /tmp or a
     trusted root, while force-push/sudo/curl|bash keep asking everywhere."""
-    path = os.path.realpath(path)
-    if path.startswith(_SCRATCH) or any(path == p[:-1] for p in _SCRATCH):
+    if is_temp_path(path):
         return True
-    return any(_match_root(path, raw) for raw in load_trusted_roots())
+    return any(_match_root(os.path.realpath(path), raw)
+               for raw in load_trusted_roots())

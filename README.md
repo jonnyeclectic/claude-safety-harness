@@ -197,12 +197,22 @@ harmless in normal/ask modes, adding just the catastrophic hard-blocks):
 
 | Tier | Behavior under bypass | Examples |
 |------|-----------------------|----------|
-| **deny**  | hard block (irreversible) | `rm -rf /` · `~` · `/*`, fork bomb, `dd`/`mkfs`/`>` to a raw device, `chmod -R` on `/` |
+| **deny**  | hard block (irreversible) | `rm -rf /` · `~` · `/*`, fork bomb, `dd`/`mkfs`/`>` to a raw device, `chmod -R` on `/`. Quoted spellings count: `rm -rf "/"` and `bash -c "rm -rf /"` are the same command. *(One exception — see “throwaway `$HOME`” below.)* |
 | **ask**   | forces a manual-approval prompt | `sudo`, force-push to a protected/shared branch, `git reset --hard <sha\|HEAD~N>`, `git clean -f`, `git rebase` on a protected branch, `curl\|bash`. *(Writes/deletes/edits outside the project also ask when `HARNESS_GATE_OUTSIDE_WORKDIR=1`; that gate is **off by default**.)* |
 | **allow** | silent pass-through (full bypass speed) | tests, builds, `git status`, reads, `commit --no-verify`, mutations inside the project or `/tmp`, force-push/rebase of a topic branch, out-of-project file writes (gate off), `git reset --hard origin/main` |
 
 - **`guard-bash.py`** — `PreToolUse` on `Bash`. Catastrophic denies and gray-area asks. The
   out-of-project write/delete ask (section 3) is **off by default** (`HARNESS_GATE_OUTSIDE_WORKDIR=1` to enable).
+
+**Throwaway `$HOME`.** `rm -rf ~` / `rm -rf "$HOME"` is denied because it wipes *your home* —
+but when `$HOME` is a temp dir it wipes nothing you own, and the deny is just in the way. So
+it is allowed when the home in effect resolves under `/tmp`, `$TMPDIR`, `/var/folders`, …,
+either because the command line retargeted it (`export HOME="$TMPDIR/x" && rm -rf "$HOME"`,
+the usual test-isolation idiom) or because the session already runs under a throwaway home
+(CI, a container, a sandboxed run). This relaxes the *home* target only: `rm -rf /`, a root
+wildcard, and an `rm` hidden in a `$(…)` substitution stay denied no matter what `$HOME` is,
+and a home under a configured *trusted root* is a real home — trusted roots are where you
+keep things, so they do not count as throwaway.
 - **`guard-paths.py`** — `PreToolUse` on `Edit|Write|MultiEdit|NotebookEdit`. The
   out-of-project file gate; **off by default** (`HARNESS_GATE_OUTSIDE_WORKDIR=1` to enable).
   When on it matters because the sandbox does **not** cover the built-in file tools.

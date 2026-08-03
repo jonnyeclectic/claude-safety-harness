@@ -30,7 +30,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from harness_common import (is_trusted, is_scratch_root,
+    from harness_common import (is_trusted, is_scratch_root, is_temp_path,
                                 outside_workdir_gate_enabled)
 except Exception:  # degrade to cwd-only if the shared helper is missing
     _SCRATCH_PREFIX = ("/tmp/", "/private/tmp/", "/var/folders/",
@@ -46,6 +46,9 @@ except Exception:  # degrade to cwd-only if the shared helper is missing
     def is_scratch_root(path):
         p = os.path.realpath(path)
         return p.startswith(_SCRATCH_PREFIX)
+
+    def is_temp_path(path):
+        return os.path.realpath(path).startswith(_SCRATCH_PREFIX)
 
     def outside_workdir_gate_enabled():
         return os.environ.get("HARNESS_GATE_OUTSIDE_WORKDIR", "").strip().lower() in (
@@ -114,6 +117,19 @@ if not CMD:
 _INTERP = {"sh", "bash", "zsh", "ksh", "dash", "ash", "csh", "tcsh", "fish",
            "python", "python2", "python3", "perl", "ruby", "node", "eval",
            "source"}
+
+# Commands whose quoted operands are the very PATHS the catastrophic DENY rules
+# in section 1 test, so their quotes must survive the scan exactly as an
+# interpreter's do. Blanking quoted data is right for a command that only PRINTS
+# or RECORDS it (`echo`, `git commit -m`) -- but `rm -rf "/"` and
+# `rm -rf "$HOME"` are the way these are actually written, and treating those
+# operands as inert data made the whole-tree rules miss the quoted form
+# entirely. Keeping them costs nothing: a target that is merely a specific path
+# (`rm -rf "$HOME/.cache"`) still fails the whole-tree rules on its own.
+_TARGET_CMDS = {"rm", "chmod", "chown", "dd", "shred", "wipefs"}
+
+# Either kind of word makes the rest of its statement's quotes CODE, not data.
+_KEEP_QUOTED = _INTERP | _TARGET_CMDS
 
 
 def split_statements(cmd):
@@ -233,13 +249,16 @@ def _strip_heredocs(cmd):
 
 def code_only(cmd):
     """`cmd` reduced to the text the shell executes as CODE: heredoc bodies and
-    quoted-argument contents removed, EXCEPT where they are still executed.
-    Structural characters (separators, pipes, redirects, quote marks) are kept,
-    so e.g. the `|` in `curl x | sh` survives for the pipe-into-shell rule.
+    quoted-argument contents removed, EXCEPT where they are still executed or are
+    a path a DENY rule must see. Structural characters (separators, pipes,
+    redirects, quote marks) are kept, so e.g. the `|` in `curl x | sh` survives
+    for the pipe-into-shell rule.
 
     Three quote contexts:
-      - interpreter arg (`bash -c "..."`, `eval "..."`): the whole quoted string
-        is executed -> kept;
+      - arg of a _KEEP_QUOTED command: either an interpreter (`bash -c "..."`,
+        `eval "..."`), where the whole quoted string is executed, or a
+        _TARGET_CMDS path operand (`rm -rf "/"`), where it is the target the
+        catastrophic rules check -> kept verbatim either way;
       - single-quoted data (`'...'`): the shell suppresses ALL expansion ->
         fully literal -> blanked;
       - double-quoted data (`"..."`): word-splitting is suppressed but command
@@ -247,24 +266,26 @@ def code_only(cmd):
         literal text is blanked but the `$(...)`/backtick spans are KEPT
         (via _keep_substitutions), so a real payload is still caught.
 
-    Single pass: the interpreter word of a statement precedes its quoted arg, so
+    Single pass: the command word of a statement precedes its quoted args, so
     tracking the words seen so far in the current statement is enough to know,
     at the moment a quote opens, whether its contents are code (keep) or data
-    (blank/substitution-only)."""
+    (blank/substitution-only). Words are only accumulated OUTSIDE quotes, so an
+    `rm` or `bash` appearing inside a message string never flips its own
+    statement into keep-mode."""
     text = _strip_heredocs(cmd)
-    out, word, quote, interp = [], [], None, False
+    out, word, quote, keep_quoted = [], [], None, False
     dq = []  # buffer of double-quoted DATA awaiting substitution-aware blanking
 
     def flush_word():
-        nonlocal interp
+        nonlocal keep_quoted
         if word:
-            if os.path.basename("".join(word)) in _INTERP:
-                interp = True
+            if os.path.basename("".join(word)) in _KEEP_QUOTED:
+                keep_quoted = True
             del word[:]
 
     for c in text:
         if quote:
-            if interp:                # interpreter runs the whole quoted arg
+            if keep_quoted:           # executed code, or a path operand we test
                 out.append(c)
                 if c == quote:
                     quote = None
@@ -288,7 +309,7 @@ def code_only(cmd):
             out.append(c)         # keep the opening quote mark
         elif c in ";\n|&":
             flush_word()
-            interp = False        # new statement -> reset interpreter context
+            keep_quoted = False   # new statement -> reset the keep-quotes context
             out.append(c)
         elif c in " \t":
             flush_word()
@@ -302,6 +323,64 @@ def code_only(cmd):
 
 
 low = code_only(CMD).lower()
+# The same scan text with quote MARKS removed, used by the whole-filesystem
+# target rules in section 1. code_only deliberately keeps the marks (and, for a
+# _TARGET_CMDS word, the quoted operand itself) -- that is what lets `rm -rf "/"`
+# be seen at all. But a mark is NOT a reliable end-of-target boundary, because a
+# single path can be quoted in pieces: `"$HOME"/.cache/foo` is one specific
+# subpath, not a home wipe, yet its target looks finished at the closing quote.
+# Dropping the marks renormalizes every spelling -- `"/"`, `"$HOME"`, `"$HOME"/`,
+# `"$HOME"/.cache` -- to the bare form the boundary rules are written against,
+# so they need no quote cases at all. Only section 1 uses this; the gray-area
+# rules keep the quote-preserving `low`.
+low_paths = low.replace('"', "").replace("'", "")
+
+def redirect_targets(stmt):
+    """Yield the target of each real (unquoted) > or >> operator in `stmt`, with
+    any quotes around it stripped. A '>' inside quotes (e.g. the '=>' in a
+    `python -c` code blob) is data, not a redirect operator, so it is ignored.
+
+    Defined here, above section 1, because a redirect target is a path the SHELL
+    writes to no matter which command runs -- so the raw-device DENY needs it
+    too, not just the out-of-workdir ask in section 3.
+    """
+    out, i, n, quote = [], 0, len(stmt), None
+    while i < n:
+        c = stmt[i]
+        if quote:
+            if c == quote:
+                quote = None
+            i += 1
+        elif c in ("'", '"'):
+            quote = c
+            i += 1
+        elif c == ">":
+            i += 1
+            if i < n and stmt[i] == ">":
+                i += 1
+            while i < n and stmt[i] in " \t":
+                i += 1
+            tok, tq = [], None
+            while i < n:
+                ch = stmt[i]
+                if tq:
+                    if ch == tq:
+                        tq = None
+                    else:
+                        tok.append(ch)
+                elif ch in ("'", '"'):
+                    tq = ch
+                elif ch in " \t\n;|&<>()`":
+                    break
+                else:
+                    tok.append(ch)
+                i += 1
+            if tok:
+                out.append("".join(tok))
+        else:
+            i += 1
+    return out
+
 
 # ---- 1. DENY: catastrophic / irreversible -----------------------------------
 # Trailing boundary for a whole-filesystem target. Beyond the usual whitespace /
@@ -310,12 +389,16 @@ low = code_only(CMD).lower()
 # target inside `"$(...)"` or `` "`...`" `` reaches the scanner as e.g.
 # `rm -rf /)` -- without `)`/backtick here the trailing char would stop the
 # target rule from matching and a real wipe/format would slip through.
+# These rules run against low_paths (quote marks stripped), so a quoted target
+# arrives in the same bare form as an unquoted one and needs no cases here.
 _END = r"(?:\s|[;&|)`]|$)"
 DENY_RULES = [
     # rm -rf whose target is the WHOLE tree: root, home, or a top-level wildcard.
-    # A specific deep path outside cwd is NOT denied here -> it falls through to
-    # the out-of-workdir "ask" gate below.
-    (r"\brm\b(?=.*\s-[a-z]*[rf])[^\n]*?\s(/|~|~/|\$home|\$home/)\*?" + _END,
+    # `$home` covers both spellings code_only can produce (`$HOME`, `${HOME}`),
+    # each with or without a trailing slash. A specific deep path outside cwd is
+    # NOT denied here (`~/.cache` fails the boundary) -> it falls through to the
+    # out-of-workdir "ask" gate below.
+    (r"\brm\b(?=.*\s-[a-z]*[rf])[^\n]*?\s(/|~/?|\$\{?home\}?/?)\*?" + _END,
      "rm -rf targeting / ~ $HOME or a filesystem wildcard is irreversible."),
     (r"--no-preserve-root",
      "--no-preserve-root removes the last guard against wiping /."),
@@ -327,8 +410,8 @@ DENY_RULES = [
      "dd writing to a raw disk device destroys data."),
     (r"\bmkfs(\.\w+)?\b",
      "mkfs reformats a filesystem."),
-    (r">\s*/dev/(disk|rdisk|sd|nvme|hd)\w*",
-     "Redirecting output onto a raw disk device destroys data."),
+    # NB: redirecting ONTO a raw device is denied separately, on the parsed
+    # statements rather than the scan text -- see _RAW_DEVICE below.
     (r"\b(shred|wipefs)\b[^\n]*/dev/",
      "shred/wipefs on a device is irreversible."),
     # recursive chmod/chown of the whole filesystem
@@ -338,9 +421,11 @@ DENY_RULES = [
      "Recursive chown on / breaks the system."),
 ]
 # These rules FIRE below, after the assignment / effective-cwd walk is built, so
-# the whole-tree rm rule (index 0) can honor a HOME reassignment made on the SAME
-# command line (`export HOME="$TMPDIR/x" && rm -rf "$HOME"`) instead of reading
-# `~`/`$HOME` as the user's real home -- see _rm_home_reassigned_to_scratch.
+# the whole-tree rm rule (index 0) can resolve what `~`/`$HOME` actually point at
+# -- a HOME reassigned on the SAME command line
+# (`export HOME="$TMPDIR/x" && rm -rf "$HOME"`), or an ambient HOME that is
+# already a temp dir -- instead of always reading them as the user's real home.
+# See _rm_home_targets_disposable_home.
 
 # ---- helpers: script-local var tracking + statement/effective-cwd walk -----
 # Split into statements once and track two things across them, in order, so
@@ -480,34 +565,60 @@ for _stmt in STATEMENTS:
 
 
 # ---- 1 (fired): DENY, now that ASSIGNS / STATEMENTS / STMT_CWDS exist --------
-def _rm_home_reassigned_to_scratch():
-    """The whole-tree rm DENY (DENY_RULES[0]) is a FALSE POSITIVE when the
-    command line ITSELF reassigned HOME (via `export HOME=...` or a `HOME=... rm`
-    prefix) to a throwaway path and the rm deletes THAT -- the routine
-    `export HOME="$TMPDIR/x" && rm -rf "$HOME"` test-isolation idiom, where `~`
-    and `$HOME` no longer mean the user's real home.
+def _home_is_disposable():
+    """Whether the HOME that this line's `~`/`$HOME` actually resolve to is a
+    throwaway home rather than the user's real one. Two ways it can be:
 
-    Return True (suppress the deny) only when HOME was reassigned on THIS line AND
-    every recursive-rm statement targets ONLY safe paths: a `~`/`$HOME` that now
-    resolves into a scratch/trusted dir (rescued), or a specific non-root path.
-    A literal `/`, a root wildcard, or a home ref that resolves OUTSIDE scratch
-    returns False so the catastrophic deny stands. Conservative by construction:
-    ambient (un-reassigned) HOME, an rm hidden in a substitution (no top-level rm
-    statement to rescue), or any parse doubt all leave the deny in place."""
-    if "HOME" not in ASSIGNS:
-        return False                  # ambient home -> a real-home wipe -> deny
+      - the command line ITSELF reassigned it (`export HOME=...`, or a
+        `HOME=... rm` prefix). The target is then checked per-rm below, so the
+        reassignment alone is enough to enter the rescue -- a reassignment to a
+        NON-scratch dir is rejected there, not here.
+      - it was ALREADY a temp dir in the ambient environment -- the session runs
+        under a throwaway home (test isolation, CI, a container, a sandboxed
+        run), so `~` means /tmp/... or $TMPDIR/... for every command, not just
+        ones that re-export it. is_temp_path, not is_scratch_root: a configured
+        trusted root is a place the owner KEEPS things, so a home living there
+        is a real home and its wipe stays denied."""
+    if "HOME" in ASSIGNS:
+        return True
+    ambient = os.environ.get("HOME")
+    return bool(ambient) and is_temp_path(ambient)
+
+
+def _rm_home_targets_disposable_home():
+    """The whole-tree rm DENY (DENY_RULES[0]) is a FALSE POSITIVE when `~`/`$HOME`
+    do not mean the user's real home -- either because the command line itself
+    retargeted HOME to a throwaway path (the routine
+    `export HOME="$TMPDIR/x" && rm -rf "$HOME"` test-isolation idiom) or because
+    the session already runs under a temp HOME (see _home_is_disposable).
+
+    Return True (suppress the deny) only when HOME is disposable AND every
+    recursive-rm statement targets ONLY safe paths: a `~`/`$HOME` that resolves
+    into a scratch/trusted dir (rescued), or a specific non-root path. A literal
+    `/`, a root wildcard, or a home ref that resolves OUTSIDE scratch returns
+    False so the catastrophic deny stands. Conservative by construction: an
+    ambient home that is NOT temp, an rm hidden in a substitution (no top-level
+    rm statement to rescue), or any parse doubt all leave the deny in place."""
+    if not _home_is_disposable():
+        return False                  # real home -> a real-home wipe -> deny
     rescued = False
     for _s, _base in zip(STATEMENTS, STMT_CWDS):
         try:
-            _rtoks = shlex.split(_s, posix=False)
+            # POSIX mode (unlike the posix=False splits elsewhere in this file):
+            # it strips the quote marks and, crucially, JOINS the pieces of a
+            # word the way the shell does. Non-POSIX mode breaks at the closing
+            # quote, turning `rm -rf "$HOME"/` into the two tokens `"$HOME"` and
+            # `/` -- and that bare `/` reads as a whole-root wipe, which would
+            # keep the deny on exactly the command this rescue exists for.
+            _rtoks = shlex.split(_s)
         except ValueError:
             return False
         # step past a leading `export` and any NAME=val prefix assignments
-        if _rtoks and _unquote(_rtoks[0]) == "export":
+        if _rtoks and _rtoks[0] == "export":
             _rtoks = _rtoks[1:]
-        while _rtoks and _ASSIGN_WORD.match(_unquote(_rtoks[0])):
+        while _rtoks and _ASSIGN_WORD.match(_rtoks[0]):
             _rtoks = _rtoks[1:]
-        if not _rtoks or os.path.basename(_unquote(_rtoks[0])) != "rm":
+        if not _rtoks or os.path.basename(_rtoks[0]) != "rm":
             continue
         _args = _rtoks[1:]
         if not any(t.startswith("-") and not t.startswith("--")
@@ -516,7 +627,7 @@ def _rm_home_reassigned_to_scratch():
         for _tok in _args:
             if _tok.startswith("-"):
                 continue
-            _core = _unquote(_tok)
+            _core = _tok
             if _core.endswith("/*"):
                 _core = _core[:-2]
             elif _core.endswith("/") and len(_core) > 1:
@@ -526,17 +637,31 @@ def _rm_home_reassigned_to_scratch():
             if _core in ("~", "$HOME", "${HOME}"):
                 _tgt = resolve_path(_core, ASSIGNS, _base)
                 if is_scratch_root(_tgt) or is_trusted(_tgt, _base):
-                    rescued = True     # reassigned home now points at scratch
+                    rescued = True     # the home in effect points at scratch
                 else:
-                    return False       # reassigned, but not to a safe place
+                    return False       # a home, but not a throwaway one
     return rescued
 
 
 for _i, (_pat, _why) in enumerate(DENY_RULES):
-    if re.search(_pat, low):
-        if _i == 0 and _rm_home_reassigned_to_scratch():
-            continue                  # in-line HOME reassignment -> not real home
+    if re.search(_pat, low_paths):
+        if _i == 0 and _rm_home_targets_disposable_home():
+            continue                  # throwaway HOME -> not the real home
         emit("deny", f"BLOCKED by harness: {_why} Command: {CMD}")
+
+# Redirect ONTO a raw disk device -- checked on the parsed statements, not the
+# scan text. The target of `> "/dev/rdisk0"` is a path the shell writes to
+# whatever the command is, but for a command that merely prints its argument
+# (`echo`, and every other non-_KEEP_QUOTED word) code_only correctly blanks the
+# quoted target as data before the regex rules ever see it. redirect_targets()
+# extracts exactly that operand, quotes stripped, so the quoted spelling is
+# caught without keeping every quoted argument of every command in the scan.
+_RAW_DEVICE = re.compile(r"^/dev/(disk|rdisk|sd|nvme|hd)\w*$")
+for _stmt in STATEMENTS:
+    for _rt in redirect_targets(_stmt):
+        if _RAW_DEVICE.match(expand_vars(_rt, ASSIGNS)):
+            emit("deny", "BLOCKED by harness: Redirecting output onto a raw disk "
+                         f"device destroys data. Command: {CMD}")
 
 # Branches whose force-push is a real, everyone-affecting history overwrite.
 # Force-pushing any OTHER explicit branch is the routine amend->force-push
@@ -689,48 +814,6 @@ MUTATORS = ("rm", "rmdir", "mv", "cp", "install", "tee", "truncate",
 # deliberately excluded: it REMOVES its sources, so an out-of-cwd source there is
 # a genuine mutation and stays gated.
 COPY_LIKE = {"cp", "install", "ln"}
-
-
-def redirect_targets(stmt):
-    """Yield the target of each real (unquoted) > or >> operator in `stmt`. A '>'
-    inside quotes (e.g. the '=>' in a `python -c` code blob) is data, not a
-    redirect operator, so it is ignored."""
-    out, i, n, quote = [], 0, len(stmt), None
-    while i < n:
-        c = stmt[i]
-        if quote:
-            if c == quote:
-                quote = None
-            i += 1
-        elif c in ("'", '"'):
-            quote = c
-            i += 1
-        elif c == ">":
-            i += 1
-            if i < n and stmt[i] == ">":
-                i += 1
-            while i < n and stmt[i] in " \t":
-                i += 1
-            tok, tq = [], None
-            while i < n:
-                ch = stmt[i]
-                if tq:
-                    if ch == tq:
-                        tq = None
-                    else:
-                        tok.append(ch)
-                elif ch in ("'", '"'):
-                    tq = ch
-                elif ch in " \t\n;|&<>()`":
-                    break
-                else:
-                    tok.append(ch)
-                i += 1
-            if tok:
-                out.append("".join(tok))
-        else:
-            i += 1
-    return out
 
 
 def write_targets(cmd_word, tokens):
