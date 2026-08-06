@@ -5,3 +5,6 @@ even-terminal-*.log
 __pycache__/
 *.pyc
 .DS_Store
+
+# Agent tool state — machine-local, not part of the harness
+.serena/

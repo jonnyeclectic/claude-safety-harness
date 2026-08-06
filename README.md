@@ -261,10 +261,33 @@ ghapi -X POST repos/{owner}/{repo}/pulls \
 ghapi graphql -f query='{viewer{login}}'
 ```
 
-`{owner}`/`{repo}` resolve from the `origin` remote, `-f`/`-F`/`-H`/`-i`/`--paginate`/
-`--jq` behave as in `gh api`, and the token is passed via a curl `--config` file so it
-never appears in `ps`. Other than `auth status`, the non-api subcommands (`gh pr create`,
-`gh run watch`) are not reimplemented — use the REST endpoints directly.
+`{owner}`/`{repo}` resolve from the `origin` remote, `-F`/`-H`/`-i`/`--paginate`/`--jq`
+behave as in `gh api`, and the token is passed via a curl `--config` file so it never
+appears in `ps`. Other than `auth status`, the non-api subcommands (`gh pr create`,
+`gh run watch`) are not reimplemented — use the REST endpoints directly. `-f` behaves as
+in `gh api` with one deliberate exception, below.
+
+### `-f` and `-F` are not interchangeable
+
+Only `-F` expands `@file`. This bites hardest on the PR-body flag in the example above,
+because getting it wrong fails *silently*:
+
+```bash
+ghapi ... -f body=@notes.md      # gh: posts the literal string "@notes.md"
+ghapi ... -F body=@notes.md      # posts the file's contents
+```
+
+GitHub accepts that first request, drops the value it can't use, and returns 200 — so the
+call exits 0 and the body you meant to send simply isn't there. Nothing reports it. `ghapi`
+diverges from `gh` here and refuses `-f k=@path` when `path` exists, naming `-F` as the
+fix. A leading `@` that *isn't* a path stays literal, since that's what `-f` is for:
+`-f body='@octocat can you review'` still posts a real mention. A field spec with no `=`
+at all (`-f body@notes.md`, a mistyped `=`) is refused for the same reason — it would
+otherwise become a field *named* `body@notes.md`, which GitHub also drops with a 200.
+
+Round-tripping a body through a file is not byte-exact: `jq -r` terminates its output with
+a newline, so `--jq .body > b.md` followed by `-F body=@b.md` grows the body by one newline
+per pass. Strip one trailing newline if the value has to survive verbatim.
 
 `git` over HTTPS works normally (it uses curl), so ordinary fetch/push/PR flows are fine.
 

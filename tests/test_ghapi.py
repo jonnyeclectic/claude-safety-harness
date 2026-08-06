@@ -194,6 +194,91 @@ class TestFieldTyping(GhapiTestCase):
         self.assertEqual(self.sent_body()["labels"], ["bug", "p1"])
 
 
+class TestFieldSpecMistakes(GhapiTestCase):
+    """The field flags fail LOUDLY rather than sending something plausible.
+
+    Both mistakes here produce a request GitHub answers 200 to while quietly
+    dropping the value, so the caller sees success and a missing field -- the
+    worst possible failure for a scripted call, and how a PR ends up opened with
+    a null body. Each must exit non-zero and name the fix instead."""
+
+    def _file(self, name="notes.md", text="hello from a file"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    # --- a field spec with no '=' -------------------------------------------
+
+    def test_field_without_equals_is_rejected(self):
+        # `-f body@notes.md` otherwise becomes a field NAMED "body@notes.md".
+        r = self.run_ghapi(["x", "-f", "body@notes.md"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("missing '='", r.stderr)
+        self.assertFalse(os.path.exists(self.stdin_log), "no request should be sent")
+
+    def test_typed_field_without_equals_is_rejected(self):
+        r = self.run_ghapi(["x", "-F", "body@notes.md"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("missing '='", r.stderr)
+
+    # --- @file handed to -f, which cannot expand it -------------------------
+
+    def test_raw_field_with_at_file_is_rejected(self):
+        path = self._file()
+        r = self.run_ghapi(["x", "-f", "body=@%s" % path])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("-F", r.stderr, "the error should name the flag that works")
+
+    def test_raw_field_with_at_stdin_is_rejected(self):
+        r = self.run_ghapi(["x", "-f", "body=@-"])
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_raw_field_at_path_is_resolved_relative_to_cwd(self):
+        """The guard is deliberately CWD-sensitive: it asks "is this a file?".
+
+        Same spec, two directories, two outcomes -- refused where the file
+        exists, literal where it doesn't. Documented in the README so nobody
+        reads the second case as the guard failing to fire."""
+        self._file("notes.md")
+        r = self.run_ghapi(["x", "-f", "body=@notes.md"], cwd=self.tmp.name)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("-F", r.stderr)
+
+        self.run_ghapi(["x", "-f", "body=@notes.md"])  # cwd=REPO, no such file
+        self.assertEqual(self.sent_body()["body"], "@notes.md")
+
+    # --- but -f must still send a literal leading @ -------------------------
+
+    def test_raw_field_keeps_at_mention_as_a_literal(self):
+        # A GitHub @mention is the reason -f exists; it is not a path.
+        self.run_ghapi(["x", "-f", "body=@octocat can you review"])
+        self.assertEqual(self.sent_body()["body"], "@octocat can you review")
+
+    def test_raw_field_keeps_at_nonexistent_path_as_a_literal(self):
+        self.run_ghapi(["x", "-f", "body=@no/such/file.md"])
+        self.assertEqual(self.sent_body()["body"], "@no/such/file.md")
+
+    # --- -F still reads the file, and says so when it cannot ----------------
+
+    def test_typed_field_reads_the_file(self):
+        path = self._file(text="body from disk")
+        self.run_ghapi(["x", "-F", "body=@%s" % path])
+        self.assertEqual(self.sent_body()["body"], "body from disk")
+
+    def test_typed_field_missing_file_is_a_clear_error_not_a_traceback(self):
+        r = self.run_ghapi(["x", "-F", "body=@/no/such/file.md"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot read", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_input_missing_file_is_a_clear_error_not_a_traceback(self):
+        r = self.run_ghapi(["x", "--input", "/no/such/file.json"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot read", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
 class TestRepoPlaceholders(GhapiTestCase):
     def test_owner_repo_resolve_from_origin_remote(self):
         repo = os.path.join(self.tmp.name, "proj")

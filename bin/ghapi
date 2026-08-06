@@ -34,6 +34,24 @@ Flag-compatible with `gh api` where it counts, so existing habits transfer:
     ghapi -X POST repos/o/r/issues -f title='Bug' -F labels[]=bug
     ghapi graphql -f query='{viewer{login}}'
 
+`-f` and `-F` are NOT interchangeable, and the difference is easy to lose:
+
+    -f k=v        literal string, always. `-f n=1` sends "1", not 1.
+    -F k=v        typed: 1 -> 1, true -> true, and **@file reads the file**.
+    -F k=@-       read the value from stdin.
+    --input f     send a whole JSON body from a file (or `-` for stdin).
+
+Only `-F` expands `@file`. `-f body=@notes.md` would post the literal string
+"@notes.md" -- and GitHub accepts that request, drops the unknown value, and
+returns 200, so nothing anywhere says the body never arrived. ghapi refuses it
+instead, and likewise refuses a field spec with no `=` at all (`-f body@notes.md`
+otherwise becomes a field NAMED "body@notes.md" with an empty value).
+
+Round-tripping a field through a file is NOT byte-exact: `jq -r` terminates its
+output with a newline, so `ghapi ... --jq .body > b.md` then `-F body=@b.md`
+writes the body back one newline longer each time. Strip exactly one trailing
+newline if you need the value preserved verbatim.
+
 {owner}/{repo} placeholders are filled from the `origin` remote, as gh does.
 Not implemented: the non-api subcommands (`gh pr create`, `gh run watch`, ...).
 Those are a much larger surface; use the REST endpoints directly.
@@ -78,11 +96,25 @@ def repo_slug():
     return m.group(1), m.group(2)
 
 
-def typed(value):
+def read_at_file(path, flag):
+    """Read the file an `@path` value names (`@-` = stdin), or die cleanly.
+
+    Without this an unreadable path surfaced as a bare Python traceback, which
+    reads like a bug in ghapi rather than a typo in the command.
+    """
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as e:
+        die(f"{flag}: cannot read @{path}: {e.strerror}")
+
+
+def typed(value, flag):
     """`-F` semantics: JSON-ish scalars stay typed, @file reads a file."""
     if value.startswith("@"):
-        path = value[1:]
-        return sys.stdin.read() if path == "-" else open(path).read()
+        return read_at_file(value[1:], flag)
     if value in ("true", "false", "null"):
         return {"true": True, "false": False, "null": None}[value]
     try:
@@ -93,6 +125,30 @@ def typed(value):
         return float(value)
     except ValueError:
         return value
+
+
+def raw(value, key, flag):
+    """`-f` semantics: the value is sent as a literal string, exactly as gh does.
+
+    With one guard. gh happily sends `-f body=@notes.md` as the 10-character
+    string "@notes.md", and GitHub ACCEPTS that request and ignores the field --
+    so the call succeeds, exits 0, and the thing you meant to send simply isn't
+    there. That is how a PR gets opened with a null body and nothing anywhere
+    says so. When the text after `@` names a file that exists, refuse and point
+    at -F.
+
+    A leading `@` that is NOT a path stays a literal, because that is exactly
+    what -f is for: `-f body='@octocat can you review'` is a real GitHub
+    mention, not a mistake.
+    """
+    if value.startswith("@"):
+        path = value[1:]
+        if path == "-" or os.path.exists(path):
+            die(f"{flag} sends values literally, so `{key}={value}` would post "
+                f"the string {value!r} rather than that file's contents.\n"
+                f"       to send the file:     -F {key}=@{path}\n"
+                f"       to send a literal @:  --input with a full JSON body")
+    return value
 
 
 def add_field(fields, key, value):
@@ -120,14 +176,23 @@ def parse_args(argv):
         if arg in ("-X", "--method"):
             a["method"] = nxt(arg).upper()
         elif arg in ("-f", "--raw-field", "-F", "--field"):
-            k, _, v = nxt(arg).partition("=")
-            add_field(a["fields"], k, v if arg in ("-f", "--raw-field") else typed(v))
+            spec = nxt(arg)
+            k, eq, v = spec.partition("=")
+            # Without this, `-f body@notes.md` (a mistyped `=`) partitions into
+            # the key "body@notes.md" and an empty value: a field GitHub does not
+            # recognize, silently drops, and still returns 200 for. The request
+            # looks like it worked and the field is just missing.
+            if not eq:
+                die(f"{arg}: missing '=' in field {spec!r} "
+                    f"(expected {arg} key=value)")
+            add_field(a["fields"], k,
+                      raw(v, k, arg) if arg in ("-f", "--raw-field")
+                      else typed(v, arg))
         elif arg in ("-H", "--header"):
             k, _, v = nxt(arg).partition(":")
             a["headers"][k.strip()] = v.strip()
         elif arg == "--input":
-            path = nxt(arg)
-            a["body"] = sys.stdin.read() if path == "-" else open(path).read()
+            a["body"] = read_at_file(nxt(arg), arg)
         elif arg == "--paginate":
             a["paginate"] = True
         elif arg in ("-i", "--include"):
