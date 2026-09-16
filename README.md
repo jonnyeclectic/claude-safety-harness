@@ -67,16 +67,18 @@ Start a **new** session afterwards so the hooks load (verify with `/hooks`).
 cd ~/projects/my-app
 claudex             # sandboxed bypass session, right here
 claudex --strict    # + no subprocess network, secrets hidden
+claudex --account claude-personal   # run as the ~/.claude-personal account
 claudex -p "…"      # any extra args pass straight through to `claude`
 ```
 
-What each mode enforces (all **verified** against Claude Code 2.1.216 on macOS):
+What each mode enforces (all **verified** against Claude Code 2.1.273 on macOS):
 
 | | `claudex` | `claudex --strict` |
 |---|---|---|
 | Write outside project + temp | 🚫 blocked at syscall | 🚫 blocked at syscall |
 | Write inside project / temp / trusted roots | ✅ allowed | ✅ allowed |
 | Subprocess network (`curl`, `npm i`, `pip`, `git fetch`) | ✅ open | 🚫 blocked (`403` at the proxy) |
+| Bind a local port (dev servers, Playwright, `jest --watch`) — macOS | ✅ allowed | 🚫 blocked at syscall |
 | Read `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, … | ✅ readable | 🚫 blocked at syscall |
 | Secret env vars (`GITHUB_TOKEN`, `AWS_*`, `*_API_KEY`) in subprocesses | visible | 🚫 scrubbed to empty |
 | Built-in `Read`/`Edit` of the above secrets | (hook `ask` only) | 🚫 `permissions.deny` |
@@ -86,12 +88,69 @@ Use plain `claudex` for everyday work where the agent needs to install deps or h
 switch to `--strict` when you don't trust the task or the repo (untrusted PRs, random
 `npm`-heavy code) and want it walled off from the network and your credentials.
 
+## Accounts (`--account`)
+
+Claude Code keeps each account's login, plugins and history in its own config dir,
+chosen by `CLAUDE_CONFIG_DIR` (default `~/.claude`). `--account <name>` points the
+session at `~/.<name>`, and combines freely with `--strict`:
+
+```bash
+claudex --account claude-personal   # CLAUDE_CONFIG_DIR=$HOME/.claude-personal
+claudex --account claude            # default account: CLAUDE_CONFIG_DIR unset
+```
+
+The name must be `claude` or `claude-<name>`, and a named account's dir must already
+exist with that exact spelling and case, so a typo fails at launch instead of starting a
+fresh, logged-out config. Without
+the flag, `claudex` uses whatever `CLAUDE_CONFIG_DIR` your shell exports. Either way it
+prints the one in effect:
+
+```
+claudex: account → /Users/you/.claude-personal
+claudex: account → /Users/you/.claude (default)
+```
+
+Switching is free: each account keeps its own stored login, so launching one never logs
+the other out. Claude Code
+[keys the macOS Keychain entry](https://code.claude.com/docs/en/authentication#credential-management)
+(or `.credentials.json` on Linux) to the config dir, and the key is the **exact**
+`CLAUDE_CONFIG_DIR` string; the default login is only used when the variable is *unset*.
+`CLAUDE_CONFIG_DIR=~/.claude` looks like the default but is a separate, empty login
+(`claude auth status` reports `loggedIn: false`), which is why `--account claude` unsets
+it. The same goes for a trailing slash or a symlinked path: a named account must be
+spelled the way it was when you logged in, which `$HOME/.claude-<name>` matches for a
+`CLAUDE_CONFIG_DIR=$HOME/.claude-<name> claude` alias.
+
+- **Credentials in the environment outrank the account.** `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_PROFILE`, the federation
+  pair (`ANTHROPIC_FEDERATION_RULE_ID` + `ANTHROPIC_ORGANIZATION_ID`) and the
+  Bedrock/Vertex/Foundry selectors
+  [take precedence](https://code.claude.com/docs/en/authentication#authentication-precedence)
+  over a config dir's cached login, so `--account` alone would still run on them. `claudex`
+  warns when you pass `--account` with one of them set. (An `apiKeyHelper` in the account's
+  own settings wins too; that one belongs to the account, so there's nothing to warn about.)
+- **Resume sessions from the account that created them.** Transcripts live under each
+  config dir, so `--resume <id>` only finds that account's sessions. Inside **cmux**, a
+  foreign id is worse than "No conversation found": cmux's `claude` wrapper looks for the
+  transcript in `~/.claude` and, finding it there, re-exports `CLAUDE_CONFIG_DIR=$HOME/.claude`
+  — the logged-out spelling above — after `claudex` has already printed your account. That
+  happens with a plain `CLAUDE_CONFIG_DIR=… claude` alias too. No stored login is touched;
+  don't `/login` from that session, just relaunch with `--account claude`.
+- **The hooks are installed per account.** `install.sh` registers the plugin in the
+  config dir it runs under, so install once for each account:
+  `CLAUDE_CONFIG_DIR=$HOME/.claude-personal ./install.sh`. The sandbox policy files and
+  `~/.claude/harness-trusted-roots.txt` stay shared across accounts.
+- **The config-dir write protection covers the active account only.** See
+  [What trusted roots can't reach](#what-trusted-roots-cant-reach).
+
 ## Auth context (API keys, Bedrock/Vertex)
 
 `claudex` forwards the auth context you set in your shell — `ANTHROPIC_API_KEY`,
-`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_PROFILE`, the
+`ANTHROPIC_FEDERATION_RULE_ID`/`ANTHROPIC_ORGANIZATION_ID` pair, `ANTHROPIC_BASE_URL`,
 `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_USE_BEDROCK`,
-`CLAUDE_CODE_USE_VERTEX` — through to `claude`, and prints which source won:
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY` — through to `claude`, and prints
+which source won:
 
 ```
 claudex: auth → env (ANTHROPIC_API_KEY)
@@ -167,6 +226,14 @@ plugin installers) need to run from a normal terminal, not from inside `claudex`
 
 Two exceptions are *not* denied and do work as trusted roots: `~/.claude/plans` and
 `~/.claude/projects/*/memory` — both are Claude Code output, not configuration.
+
+With more than one account, `~/.claude` above means **the session's own** config dir: the
+sandbox protects
+["`~/.claude`, or the directory `CLAUDE_CONFIG_DIR` points to"](https://code.claude.com/docs/en/sandboxing).
+Under `claudex --account claude-personal` that is `~/.claude-personal`, and nothing says
+`~/.claude` keeps the same protection. The trusted-roots file is shared by every account,
+so never list any account's config dir (`~/.claude`, `~/.claude-*`) or a parent of one as
+a trusted root.
 
 One consequence worth knowing: `~/.claude/session-env` is on the deny list, so a **nested
 `claude` cannot start** inside a `claudex` session — it exits with
@@ -321,6 +388,50 @@ They all follow from the sandbox doing its job, and none indicate a broken insta
   Note it *copies* rather than symlinks, so editing `bin/ghapi` in the repo does not
   change the installed copy until you reinstall.
 
+### `dotnet test` needs two more things the sandbox can't give it
+
+`allowLocalBinding` gets the .NET test host past `bind()`, but on macOS two further
+blocks sit behind it. Both are Claude Code sandbox gaps, not harness settings, so there is
+nothing to flip here — these are the workarounds.
+
+**1. The test host connects over a dual-stack socket, which the loopback rule doesn't
+match.** `allowLocalBinding` emits `(allow network-outbound (remote ip "localhost:*"))`,
+and Seatbelt's `localhost` covers `127.0.0.1` and `::1` — but *not* `::ffff:127.0.0.1`.
+VSTest builds its client with a parameterless `new TcpClient`, which is an IPv6 socket
+with `DualMode=True`, so `Connect(IPAddress.Loopback, …)` leaves as the v4-mapped form and
+is denied. Measured against a loopback port the profile already allows:
+
+```
+AF_INET   127.0.0.1              -> OK
+AF_INET6  ::1                    -> ECONNREFUSED   (rule matched; nothing listening)
+AF_INET6  dual ::ffff:127.0.0.1  -> EPERM          (rule did not match)
+```
+
+Force the runtime onto IPv4 — per shell, or permanently in the test project:
+
+```bash
+export DOTNET_SYSTEM_NET_DISABLEIPV6=1
+```
+```xml
+<ItemGroup>
+  <RuntimeHostConfigurationOption Include="System.Net.DisableIPv6" Value="true" />
+</ItemGroup>
+```
+
+**2. `dotnet restore` fails inside the sandbox, whatever the feed.** `getdomainname()`
+reads the `kern.nisdomainname` sysctl, which isn't in the sandbox's read allow-list, so it
+returns `EPERM`; `System.Net.CookieContainer`'s static constructor calls it, and NuGet's
+HTTP stack builds one before any request goes out. The error names the feed and looks like
+a network problem, but it fires before a single byte is sent:
+
+```
+error NU1301: Unable to load the service index for source https://…/index.json
+error NU1301:   The type initializer for 'System.Net.CookieContainer' threw an exception.
+error NU1301:   GetDomainName: -1
+```
+
+Restore from a normal terminal first, then `dotnet test --no-restore` inside the session.
+
 ## Limitations (know what this does and doesn't stop)
 
 - The sandbox wraps **bash subprocesses**, not the built-in `Read`/`Edit`/`Write` tools —
@@ -330,6 +441,12 @@ They all follow from the sandbox doing its job, and none indicate a broken insta
   for untrusted work.
 - The `--strict`/managed network filter matches on hostname (SNI); a determined attacker
   could domain-front. It's strong risk-reduction, not a cryptographic boundary.
+- Non-strict `claudex` sets `sandbox.network.allowLocalBinding`, so a subprocess can reach
+  **anything already listening on your machine** — an SSH-forwarded database, a container
+  API, a `node --inspect` port (which is arbitrary code execution in an *unsandboxed*
+  process, and therefore a way out of the filesystem wall). It can also bind `0.0.0.0` and
+  accept connections from your LAN. None of that traverses the egress proxy or records a
+  violation. `--strict` does not set it; that's the profile for code you don't trust.
 - For fully unattended runs, prefer a container/VM (e.g. Anthropic's devcontainer with its
   iptables egress firewall) — that isolates the kernel and network, which no host-level
   sandbox can fully do.

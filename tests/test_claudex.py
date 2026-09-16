@@ -24,6 +24,7 @@ one -- it would pass either way. TestArrayExpansionGuardPresent below is a
 static source check that fails in CI if the guard is ever removed, which is
 the only way this specific regression is caught outside of macOS.
 """
+import json
 import os
 import shutil
 import stat
@@ -53,6 +54,10 @@ AUTH_ENV_VARS = (
     "ANTHROPIC_BASE_URL",
     "CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV",
     "CLAUDEX_NO_AUTH_PASSTHROUGH",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
 )
 
 
@@ -93,6 +98,8 @@ class ClaudexCase(unittest.TestCase):
         self.env["TMPDIR"] = tempfile.gettempdir()
         for var in AUTH_ENV_VARS:
             self.env.pop(var, None)
+        # The account a developer's own session runs under must not leak in.
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
 
     def run_claudex(self, args=()):
         return subprocess.run(
@@ -189,6 +196,154 @@ class TestTrustedRootsAddDir(ClaudexCase):
             ["--add-dir", os.path.realpath(self.trusted_dir), "foo", "bar"])
 
 
+# The types Claude Code's settings schema expects for every key these two policy
+# files may set. Used as a tripwire, not documentation: see
+# TestSandboxPolicyContent for why a wrong type here is worse than a wrong value.
+POLICY_TYPES = {
+    ("sandbox", "enabled"): bool,
+    ("sandbox", "failIfUnavailable"): bool,
+    ("sandbox", "allowUnsandboxedCommands"): bool,
+    ("sandbox", "filesystem", "allowWrite"): list,
+    ("sandbox", "filesystem", "denyRead"): list,
+    ("sandbox", "filesystem", "allowRead"): list,
+    ("sandbox", "filesystem", "denyWrite"): list,
+    ("sandbox", "network", "allowLocalBinding"): bool,
+    ("sandbox", "network", "allowedDomains"): list,
+    ("sandbox", "network", "deniedDomains"): list,
+    ("sandbox", "network", "allowManagedDomainsOnly"): bool,
+    ("sandbox", "network", "allowUnixSockets"): list,
+    ("sandbox", "network", "allowMachLookup"): list,
+    ("sandbox", "credentials", "files"): list,
+    ("sandbox", "credentials", "envVars"): list,
+    ("permissions", "deny"): list,
+    ("permissions", "ask"): list,
+    ("permissions", "allow"): list,
+}
+
+
+class TestSandboxPolicyContent(ClaudexCase):
+    """The policy templates ARE the sandbox, and nothing asserted on their
+    contents before -- only that the files exist and get copied.
+
+    Two invariants. First, a key a profile promises has to survive
+    `compose-settings.py` into the settings `claude` is actually launched with;
+    compose only setdefault()s `sandbox.filesystem.allowWrite`, so everything
+    else rides along untouched, but that is a property worth pinning rather than
+    assuming.
+
+    Second, and the reason this file gets a type tripwire where the rest of the
+    suite gets behavior: a settings file that fails schema validation is skipped
+    *whole*, and silently. `failIfUnavailable` lives inside the file that gets
+    dropped, so one mistyped value does not fail the launch loudly -- it removes
+    the sandbox and hands you a bypassPermissions session with no wall. Verified
+    against Claude Code 2.1.273: a `--settings` file identical but for
+    `"allowLocalBinding": "yes"` had its every rule ignored, with nothing on
+    stdout or stderr to say so.
+    """
+
+    def compose(self, template):
+        """The composed settings `claudex` would pass to `claude --settings`.
+
+        Run against the $HARNESS_DIR copies, the same trio install.sh ships.
+        claudex's own composed file cannot be read after the fact -- its EXIT
+        trap deletes the whole workdir before run_claudex() returns.
+        """
+        out = os.path.join(self.tmp, template + ".composed")
+        proc = subprocess.run(
+            [sys.executable, os.path.join(self.harness_dir, "compose-settings.py"),
+             os.path.join(self.harness_dir, template), "NONE", out],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_base_allows_binding_a_local_port(self):
+        """Without this, anything that talks to a helper process over a local
+        socket dies at bind(): dev servers, Playwright, `jest --watch`, and the
+        .NET test host. Base already leaves egress open, so it is the profile
+        that can afford the loopback surface.
+
+        This buys bind() only. The .NET test host also needs its connect() to
+        land, and a dual-stack `TcpClient` reaches loopback as
+        `::ffff:127.0.0.1`, which the rule this flag adds does not match -- see
+        the `dotnet test` section of the README."""
+        cfg = self.compose("sandbox.base.json")
+        self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], True)
+
+    def test_strict_does_not_allow_binding_a_local_port(self):
+        """The one that must not drift. On macOS the same flag also emits
+        `(allow network-outbound (remote ip "localhost:*"))`, which reaches
+        loopback WITHOUT traversing the egress proxy -- and the proxy is the
+        only thing enforcing strict's `deniedDomains: ["*"]`. One `ssh -D`, one
+        mitmproxy, one sibling claudex session's proxy, and strict's single
+        stated guarantee is gone with no violation recorded."""
+        network = self.compose("sandbox.strict.json")["sandbox"]["network"]
+        self.assertNotIn("allowLocalBinding", network)
+        self.assertEqual(network["deniedDomains"], ["*"])
+
+    def test_trusted_roots_do_not_disturb_the_rest_of_the_policy(self):
+        """compose() injects into sandbox.filesystem.allowWrite; every sibling
+        key must round-trip untouched."""
+        roots_file = os.path.join(self.tmp, "roots.txt")
+        with open(roots_file, "w", encoding="utf-8") as fh:
+            fh.write(self.tmp + "\n")
+        out = os.path.join(self.tmp, "with-roots.json")
+        proc = subprocess.run(
+            [sys.executable, os.path.join(self.harness_dir, "compose-settings.py"),
+             os.path.join(self.harness_dir, "sandbox.base.json"), roots_file, out],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        self.assertEqual(cfg["sandbox"]["filesystem"]["allowWrite"],
+                         [os.path.realpath(self.tmp)])
+        self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], True)
+        self.assertIs(cfg["sandbox"]["enabled"], True)
+        self.assertIs(cfg["sandbox"]["allowUnsandboxedCommands"], False)
+
+    def test_every_policy_value_has_the_type_the_schema_expects(self):
+        """A wrong type silently voids the entire file -- sandbox included."""
+        for template in ("sandbox.base.json", "sandbox.strict.json"):
+            with self.subTest(template=template):
+                with open(os.path.join(REPO_ROOT, "settings", template),
+                          encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                for path, value in self.leaves(cfg):
+                    expected = POLICY_TYPES.get(path)
+                    self.assertIsNotNone(
+                        expected,
+                        "%s sets %s, which this test does not know the type of. "
+                        "Add it to POLICY_TYPES -- a key that reaches Claude "
+                        "Code untyped is a key that can void the file."
+                        % (template, ".".join(path)))
+                    self.assertIsInstance(
+                        value, expected,
+                        "%s: %s should be %s, got %r"
+                        % (template, ".".join(path), expected.__name__, value))
+
+    @staticmethod
+    def leaves(cfg):
+        """(path, value) for each setting, descending only into plain objects.
+
+        Keys starting with `_` are comments (the repo's existing convention in
+        settings/managed-network-allowlist.json) and are skipped; Claude Code
+        drops unknown keys rather than rejecting the file.
+        """
+        out = []
+
+        def walk(node, path):
+            for key, value in node.items():
+                if key.startswith("_"):
+                    continue
+                if isinstance(value, dict):
+                    walk(value, path + (key,))
+                else:
+                    out.append((path + (key,), value))
+
+        walk(cfg, ())
+        return out
+
+
 class TestAuthContextPassthrough(ClaudexCase):
     """The caller's Anthropic auth context must survive the trip to `claude`.
 
@@ -258,6 +413,186 @@ class TestAuthContextPassthrough(ClaudexCase):
         proc = self.run_claudex(["--strict", "-p", "hi"])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.stub_tail_argv(), ["-p", "hi"])
+
+
+class TestAccountSelection(ClaudexCase):
+    """--account <name> picks the Claude config dir (~/.<name>) -- and with it
+    the cached login, plugins and history -- the same way a
+    `CLAUDE_CONFIG_DIR=$HOME/.claude-personal claude` alias does.
+
+    Claude Code keys the stored login by the literal CLAUDE_CONFIG_DIR string,
+    and uses the unsuffixed default only when the variable is unset. Verified
+    against 2.1.272: `CLAUDE_CONFIG_DIR=$HOME/.claude claude auth status`
+    reports loggedIn=false while the same account is logged in with the
+    variable unset. So the default account must unset it, never set it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.tmp, "home")
+        for name in (".claude", ".claude-personal"):
+            os.makedirs(os.path.join(self.home, name))
+        self.env["HOME"] = self.home
+
+    def test_account_sets_the_config_dir(self):
+        proc = self.run_claudex(["--account", "claude-personal"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.stub_env().get("CLAUDE_CONFIG_DIR"),
+                         os.path.join(self.home, ".claude-personal"))
+        self.assertIn(os.path.join(self.home, ".claude-personal"), proc.stderr)
+
+    def test_equals_form(self):
+        proc = self.run_claudex(["--account=claude-personal"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.stub_env().get("CLAUDE_CONFIG_DIR"),
+                         os.path.join(self.home, ".claude-personal"))
+
+    def test_config_dir_is_the_literal_home_path(self):
+        """The login is keyed by the exact string, so no realpath or trailing
+        slash: it must match what `CLAUDE_CONFIG_DIR=$HOME/.claude-x claude`
+        stored at login, even when $HOME is reached through a symlink."""
+        linked_home = os.path.join(self.tmp, "home-link")
+        os.symlink(self.home, linked_home)
+        self.env["HOME"] = linked_home
+        proc = self.run_claudex(["--account", "claude-personal"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.stub_env().get("CLAUDE_CONFIG_DIR"),
+                         linked_home + "/.claude-personal")
+
+    def test_default_account_unsets_the_config_dir(self):
+        proc = self.run_claudex(["--account", "claude"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.stub_env())
+        self.assertIn("(default)", proc.stderr)
+
+    def test_default_account_equals_form(self):
+        proc = self.run_claudex(["--account=claude"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.stub_env())
+
+    def test_account_is_consumed_wherever_it_appears(self):
+        proc = self.run_claudex(
+            ["-p", "hi", "--account", "claude-personal", "--strict", "--verbose"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.stub_tail_argv(), ["-p", "hi", "--verbose"])
+        self.assertIn("STRICT", proc.stderr)
+
+    def test_no_flag_leaves_the_config_dir_unset(self):
+        proc = self.run_claudex([])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.stub_env())
+        self.assertIn(os.path.join(self.home, ".claude"), proc.stderr)
+
+    def test_no_flag_keeps_an_inherited_config_dir(self):
+        inherited = os.path.join(self.home, ".claude-personal")
+        self.env["CLAUDE_CONFIG_DIR"] = inherited
+        proc = self.run_claudex([])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.stub_env().get("CLAUDE_CONFIG_DIR"), inherited)
+        self.assertIn(inherited, proc.stderr)
+
+    def test_default_account_overrides_an_inherited_config_dir(self):
+        """Switching back from a `claude-personal` shell to the default login."""
+        self.env["CLAUDE_CONFIG_DIR"] = os.path.join(self.home, ".claude-personal")
+        proc = self.run_claudex(["--account", "claude"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.stub_env())
+
+    def test_named_account_overrides_an_inherited_config_dir(self):
+        os.makedirs(os.path.join(self.home, ".claude-work"))
+        self.env["CLAUDE_CONFIG_DIR"] = os.path.join(self.home, ".claude-personal")
+        proc = self.run_claudex(["--account", "claude-work"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.stub_env().get("CLAUDE_CONFIG_DIR"),
+                         os.path.join(self.home, ".claude-work"))
+
+    def assertRefused(self, args, *needles):
+        proc = self.run_claudex(args)
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(self.stub_argv(), "claude must not launch")
+        self.assertNotIn("unbound variable", proc.stderr)
+        for needle in needles:
+            self.assertIn(needle, proc.stderr)
+
+    def test_missing_value_is_refused(self):
+        self.assertRefused(["--account"], "--account")
+
+    def test_empty_value_is_refused(self):
+        self.assertRefused(["--account="], "--account")
+
+    def test_non_claude_name_is_refused(self):
+        os.makedirs(os.path.join(self.home, ".ssh"))
+        self.assertRefused(["--account", "ssh"], "ssh")
+
+    def test_path_in_name_is_refused(self):
+        self.assertRefused(["--account", "claude-x/../../etc"], "claude-x/../../etc")
+
+    def test_account_without_a_config_dir_is_refused(self):
+        self.assertRefused(["--account", "claude-work"],
+                           os.path.join(self.home, ".claude-work"))
+
+    def test_wrong_case_name_is_refused(self):
+        """macOS's default APFS is case-insensitive, so `-d ~/.claude-Personal`
+        is true while the login is keyed by the exact string: a case typo would
+        start a logged-out session on top of the real account's files. On a
+        case-sensitive filesystem (Linux CI) this passes either way; macOS is
+        where it guards the exact-name match."""
+        self.assertRefused(["--account", "claude-Personal"],
+                           os.path.join(self.home, ".claude-Personal"))
+
+    def test_env_credentials_outranking_the_account_are_flagged(self):
+        """Picking an account does nothing for auth if an env key wins anyway."""
+        self.env["ANTHROPIC_API_KEY"] = "sk-ant-api03-test"
+        proc = self.run_claudex(["--account", "claude-personal"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("warning", proc.stderr)
+        self.assertIn("ANTHROPIC_API_KEY", proc.stderr)
+
+    def test_env_credentials_with_the_default_account_are_flagged(self):
+        """The default account has no CLAUDE_CONFIG_DIR to name; must not
+        trip `set -u` while building the warning."""
+        self.env["ANTHROPIC_API_KEY"] = "sk-ant-api03-test"
+        proc = self.run_claudex(["--account", "claude"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertIn("warning", proc.stderr)
+        self.assertIn("ANTHROPIC_API_KEY", proc.stderr)
+
+    def test_other_credentials_that_outrank_a_login_are_flagged(self):
+        """Per the authentication-precedence docs, these win over /login too."""
+        for extra in ({"CLAUDE_CODE_USE_FOUNDRY": "1"},
+                      {"ANTHROPIC_PROFILE": "work"},
+                      {"ANTHROPIC_FEDERATION_RULE_ID": "rule",
+                       "ANTHROPIC_ORGANIZATION_ID": "org"}):
+            with self.subTest(extra=extra):
+                self.env.update(extra)
+                try:
+                    proc = self.run_claudex(["--account", "claude-personal"])
+                finally:
+                    for k in extra:
+                        self.env.pop(k, None)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("warning", proc.stderr)
+                self.assertIn(sorted(extra)[0], proc.stderr)
+
+    def test_half_a_federation_pair_is_not_flagged(self):
+        """Federation credentials apply only when both variables are set."""
+        self.env["ANTHROPIC_ORGANIZATION_ID"] = "org"
+        proc = self.run_claudex(["--account", "claude-personal"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("warning", proc.stderr)
+
+    def test_non_credential_auth_context_is_not_flagged(self):
+        self.env["ANTHROPIC_MODEL"] = "claude-opus-5"
+        proc = self.run_claudex(["--account", "claude-personal"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("warning", proc.stderr)
+
+    def test_env_credentials_without_the_flag_are_not_flagged(self):
+        self.env["ANTHROPIC_API_KEY"] = "sk-ant-api03-test"
+        proc = self.run_claudex([])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("warning", proc.stderr)
 
 
 class TestArrayExpansionGuardPresent(unittest.TestCase):
