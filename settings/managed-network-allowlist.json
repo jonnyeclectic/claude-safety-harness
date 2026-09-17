@@ -3,6 +3,8 @@
   "sandbox": {
     "enabled": true,
     "network": {
+      "_comment": "allowLocalBinding false is load-bearing: base claudex sets it true, and on macOS that also lets a subprocess connect() to localhost without the egress proxy, so any local proxy (ssh -D, a dev proxy) would carry traffic this allow-list never sees. Managed settings outrank claudex's --settings, so this false wins while this file is the managed source Claude Code applies; claudex also writes false itself when it finds this allow-list. The cost: on macOS, sandboxed commands can't bind a local port (dev servers, Playwright, jest --watch). Never add localhost, 127.0.0.1, ::1 or * to allowedDomains: the proxy would then carry the same connections.",
+      "allowLocalBinding": false,
       "allowManagedDomainsOnly": true,
       "allowedDomains": [
         "api.anthropic.com",

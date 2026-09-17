@@ -15,6 +15,11 @@ Usage:  compose-settings.py <template.json> <trusted-roots.txt|NONE> <out.json>
 Note: ``sandbox.filesystem.allowWrite`` is ADDITIVE — the current working
 directory and the session temp dir stay writable by default, so we never need to
 re-add them here.
+
+If file-based managed settings turn on the network allow-list
+(``sandbox.network.allowManagedDomainsOnly``), ``allowLocalBinding`` is written
+as false whatever the template says: on macOS it lets a subprocess reach
+localhost without the proxy that enforces the allow-list.
 """
 import glob
 import json
@@ -54,6 +59,73 @@ def expand_roots(path):
     return out
 
 
+def managed_settings_dir():
+    """The directory Claude Code reads file-based managed settings from.
+
+    Claude Code 2.1.274 always reads the fixed OS directory; it has no working
+    override. ``CLAUDEX_MANAGED_SETTINGS_DIR`` exists only so the tests can
+    point this at a scratch directory instead of the machine's real policy.
+    """
+    override = os.environ.get("CLAUDEX_MANAGED_SETTINGS_DIR")
+    if override:
+        return override
+    if sys.platform == "darwin":
+        return "/Library/Application Support/ClaudeCode"
+    return "/etc/claude-code"
+
+
+def read_managed_json(path):
+    """Parse one managed file the way Claude Code reads it, or None.
+
+    Claude Code decodes a leading UTF-16LE byte-order mark as UTF-16 and
+    anything else as UTF-8, then strips one leading U+FEFF before parsing.
+    Python's json refuses both marks, so skipping on them would miss an
+    allow-list Claude Code applies.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        text = data.decode("utf-16-le" if data.startswith(b"\xff\xfe") else "utf-8")
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        return json.loads(text)
+    except (OSError, ValueError):
+        return None
+
+
+def managed_allowlist_active(managed_dir):
+    """True if file-based managed settings set allowManagedDomainsOnly.
+
+    Reads what Claude Code's file tier reads: managed-settings.json, then
+    managed-settings.d/*.json (dotfiles excluded, as glob excludes them). A
+    file that isn't valid JSON is skipped here; Claude Code refuses to start
+    with one, so there is no session to protect.
+
+    Any file setting it to true counts, even if a later file sets something
+    else. Claude Code lets later files win, but drops a file's whole
+    ``sandbox`` key when any value in it is mistyped, so a later file can't be
+    trusted to switch the allow-list off. Erring this way only costs local
+    binding.
+
+    The template's own ``allowLocalBinding: false`` doesn't make this
+    redundant. Claude Code merges only the highest managed source into
+    settings (server-managed, then an MDM profile, then these files) but reads
+    ``allowManagedDomainsOnly`` from every source, so with org-pushed settings
+    present the allow-list applies while the file's ``false`` is dropped. An
+    allow-list pushed only through MDM or server-managed settings isn't seen
+    here; it needs ``allowLocalBinding: false`` in that same source.
+    """
+    paths = [os.path.join(managed_dir, "managed-settings.json")]
+    paths += sorted(glob.glob(os.path.join(managed_dir, "managed-settings.d", "*.json")))
+    for path in paths:
+        cfg = read_managed_json(path)
+        sandbox = cfg.get("sandbox") if isinstance(cfg, dict) else None
+        network = sandbox.get("network") if isinstance(sandbox, dict) else None
+        if isinstance(network, dict) and network.get("allowManagedDomainsOnly") is True:
+            return True
+    return False
+
+
 def main():
     if len(sys.argv) != 4:
         sys.stderr.write(
@@ -72,6 +144,14 @@ def main():
         for d in roots:
             if d not in allow_write:
                 allow_write.append(d)
+
+    if managed_allowlist_active(managed_settings_dir()):
+        network = cfg.setdefault("sandbox", {}).setdefault("network", {})
+        if network.get("allowLocalBinding") is True:
+            sys.stderr.write(
+                "claudex: managed network allow-list found; local port binding "
+                "is off so nothing can reach localhost around it\n")
+        network["allowLocalBinding"] = False
 
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)

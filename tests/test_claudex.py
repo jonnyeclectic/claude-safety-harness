@@ -100,6 +100,11 @@ class ClaudexCase(unittest.TestCase):
             self.env.pop(var, None)
         # The account a developer's own session runs under must not leak in.
         self.env.pop("CLAUDE_CONFIG_DIR", None)
+        # Nor this machine's managed settings: compose-settings.py reads the
+        # OS directory Claude Code reads unless pointed elsewhere. Empty (not
+        # even created) unless a test writes a policy into it.
+        self.managed_dir = os.path.join(self.tmp, "managed")
+        self.env["CLAUDEX_MANAGED_SETTINGS_DIR"] = self.managed_dir
 
     def run_claudex(self, args=()):
         return subprocess.run(
@@ -196,7 +201,7 @@ class TestTrustedRootsAddDir(ClaudexCase):
             ["--add-dir", os.path.realpath(self.trusted_dir), "foo", "bar"])
 
 
-# The types Claude Code's settings schema expects for every key these two policy
+# The types Claude Code's settings schema expects for every key these policy
 # files may set. Used as a tripwire, not documentation: see
 # TestSandboxPolicyContent for why a wrong type here is worse than a wrong value.
 POLICY_TYPES = {
@@ -252,10 +257,17 @@ class TestSandboxPolicyContent(ClaudexCase):
         proc = subprocess.run(
             [sys.executable, os.path.join(self.harness_dir, "compose-settings.py"),
              os.path.join(self.harness_dir, template), "NONE", out],
-            capture_output=True, text=True)
+            capture_output=True, text=True, env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.compose_stderr = proc.stderr
         with open(out, encoding="utf-8") as fh:
             return json.load(fh)
+
+    def write_managed(self, relpath, cfg):
+        path = os.path.join(self.managed_dir, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
 
     def test_base_allows_binding_a_local_port(self):
         """Without this, anything that talks to a helper process over a local
@@ -270,16 +282,108 @@ class TestSandboxPolicyContent(ClaudexCase):
         cfg = self.compose("sandbox.base.json")
         self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], True)
 
-    def test_strict_does_not_allow_binding_a_local_port(self):
+    def test_strict_pins_local_binding_off(self):
         """The one that must not drift. On macOS the same flag also emits
         `(allow network-outbound (remote ip "localhost:*"))`, which reaches
         loopback WITHOUT traversing the egress proxy -- and the proxy is the
         only thing enforcing strict's `deniedDomains: ["*"]`. One `ssh -D`, one
         mitmproxy, one sibling claudex session's proxy, and strict's single
-        stated guarantee is gone with no violation recorded."""
+        stated guarantee is gone with no violation recorded.
+
+        Leaving the key out is not enough: Claude Code 2.1.274 honors
+        `sandbox.network.allowLocalBinding` from a repo's own
+        `.claude/settings.json` (it is not on the list of sandbox keys project
+        settings may not set). The `--settings` file outranks project and
+        local settings, so only an explicit `false` here keeps an untrusted
+        repo from turning it back on."""
         network = self.compose("sandbox.strict.json")["sandbox"]["network"]
-        self.assertNotIn("allowLocalBinding", network)
+        self.assertIs(network.get("allowLocalBinding"), False)
         self.assertEqual(network["deniedDomains"], ["*"])
+
+    def test_base_turns_local_binding_off_under_the_managed_allowlist(self):
+        """The template's own `false` (below) is not enough on every machine.
+        Claude Code keeps only the highest managed source for merged settings
+        -- server-managed settings, then an MDM profile, then this file -- but
+        reads `allowManagedDomainsOnly` from all of them. With org-pushed
+        settings present, the allow-list still applies while the file's
+        `false` is dropped, and base's `true` reopens the localhost route
+        around it. claudex writes the `--settings` file, so it can look for
+        the allow-list itself and not ask for binding in the first place."""
+        with open(os.path.join(REPO_ROOT, "settings", "managed-network-allowlist.json"),
+                  encoding="utf-8") as fh:
+            self.write_managed("managed-settings.json", json.load(fh))
+        cfg = self.compose("sandbox.base.json")
+        self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], False)
+        self.assertIn("allow-list", self.compose_stderr)
+
+    def test_managed_allowlist_in_a_drop_in_is_seen_too(self):
+        """install.sh refuses to overwrite an existing managed-settings.json,
+        so an allow-list can just as well arrive as a managed-settings.d
+        drop-in merged over a hooks-only base file."""
+        self.write_managed("managed-settings.json",
+                           {"hooks": {"PreToolUse": []}})
+        self.write_managed("managed-settings.d/50-network.json",
+                           {"sandbox": {"network": {"allowManagedDomainsOnly": True,
+                                                    "allowedDomains": ["pypi.org"]}}})
+        cfg = self.compose("sandbox.base.json")
+        self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], False)
+
+    def test_managed_allowlist_saved_with_a_byte_order_mark_is_seen(self):
+        """Claude Code 2.1.274 reads a managed file that starts with a UTF-8
+        BOM, or with the UTF-16LE one, and applies it. Python's json refuses
+        both, and skipping the file would leave base binding on under a live
+        allow-list. Files saved on Windows or by MDM tooling carry them."""
+        with open(os.path.join(REPO_ROOT, "settings", "managed-network-allowlist.json"),
+                  encoding="utf-8") as fh:
+            text = fh.read()
+        for label, data in (("utf-8", b"\xef\xbb\xbf" + text.encode("utf-8")),
+                            ("utf-16le", b"\xff\xfe" + text.encode("utf-16-le"))):
+            with self.subTest(bom=label):
+                os.makedirs(self.managed_dir, exist_ok=True)
+                with open(os.path.join(self.managed_dir, "managed-settings.json"), "wb") as fh:
+                    fh.write(data)
+                cfg = self.compose("sandbox.base.json")
+                self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], False)
+
+    def test_a_later_mistyped_drop_in_does_not_hide_the_allowlist(self):
+        """Claude Code drops a managed file's whole `sandbox` key when any value
+        in it has the wrong type, so a later drop-in with
+        `"allowManagedDomainsOnly": "false"` leaves the earlier `true` in
+        force. Counting the allow-list as on whenever any file sets it true
+        errs toward binding off, the safe side."""
+        self.write_managed("managed-settings.json",
+                           {"sandbox": {"network": {"allowManagedDomainsOnly": True,
+                                                    "allowedDomains": ["pypi.org"]}}})
+        self.write_managed("managed-settings.d/50-typo.json",
+                           {"sandbox": {"network": {"allowManagedDomainsOnly": "false"}}})
+        cfg = self.compose("sandbox.base.json")
+        self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], False)
+
+    def test_managed_settings_without_the_allowlist_leave_binding_on(self):
+        """A managed file that only installs hooks -- common on company
+        machines -- must not cost base its dev servers."""
+        self.write_managed("managed-settings.json",
+                           {"hooks": {"PreToolUse": []}})
+        cfg = self.compose("sandbox.base.json")
+        self.assertIs(cfg["sandbox"]["network"]["allowLocalBinding"], True)
+        self.assertEqual(self.compose_stderr, "")
+
+    def test_managed_allowlist_turns_local_binding_back_off(self):
+        """The managed allow-list filters base claudex too, so base's
+        `allowLocalBinding: true` would hand every session the same direct
+        localhost connect strict refuses: route through any local proxy and
+        the allow-list never sees the request.
+
+        Managed settings outrank the `--settings` file claudex launches with
+        (Claude Code 2.1.274 merges user < project < local < flag < policy),
+        so an explicit `false` here wins over base's `true`, and covers plain
+        `claude` too. That holds only while this file is the managed source in
+        effect; the compose-side check below covers the rest."""
+        with open(os.path.join(REPO_ROOT, "settings", "managed-network-allowlist.json"),
+                  encoding="utf-8") as fh:
+            network = json.load(fh)["sandbox"]["network"]
+        self.assertIs(network["allowManagedDomainsOnly"], True)
+        self.assertIs(network.get("allowLocalBinding"), False)
 
     def test_trusted_roots_do_not_disturb_the_rest_of_the_policy(self):
         """compose() injects into sandbox.filesystem.allowWrite; every sibling
@@ -291,7 +395,7 @@ class TestSandboxPolicyContent(ClaudexCase):
         proc = subprocess.run(
             [sys.executable, os.path.join(self.harness_dir, "compose-settings.py"),
              os.path.join(self.harness_dir, "sandbox.base.json"), roots_file, out],
-            capture_output=True, text=True)
+            capture_output=True, text=True, env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(out, encoding="utf-8") as fh:
             cfg = json.load(fh)
@@ -302,8 +406,10 @@ class TestSandboxPolicyContent(ClaudexCase):
         self.assertIs(cfg["sandbox"]["allowUnsandboxedCommands"], False)
 
     def test_every_policy_value_has_the_type_the_schema_expects(self):
-        """A wrong type silently voids the entire file -- sandbox included."""
-        for template in ("sandbox.base.json", "sandbox.strict.json"):
+        """A wrong type voids a `--settings` file whole, and drops the entire
+        `sandbox` key of a managed file -- the sandbox either way."""
+        for template in ("sandbox.base.json", "sandbox.strict.json",
+                         "managed-network-allowlist.json"):
             with self.subTest(template=template):
                 with open(os.path.join(REPO_ROOT, "settings", template),
                           encoding="utf-8") as fh:
