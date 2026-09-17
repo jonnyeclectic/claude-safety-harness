@@ -5,6 +5,10 @@
     "allowUnsandboxedCommands": false,
     "filesystem": {
       "allowWrite": []
+    },
+    "network": {
+      "_comment": "allowLocalBinding is macOS-only and grants three Seatbelt rules, not one: bind on any local address (including 0.0.0.0), accept inbound on it (including from the LAN), and connect() to localhost WITHOUT going through the egress proxy. Base already leaves egress open, so the trade is acceptable here; it is deliberately absent from sandbox.strict.json, where the proxy is the only thing enforcing deniedDomains ['*'] and this would punch straight through it. Ignored on Linux.",
+      "allowLocalBinding": true
     }
   }
 }

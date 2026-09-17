@@ -5,6 +5,11 @@
 #                      project + temp (kernel-enforced); network open.
 #   claudex --strict   same, plus: NO subprocess network egress, secret files
 #                      (~/.ssh, ~/.aws, ...) hidden, secret env vars scrubbed.
+#   claudex --account claude-personal
+#                      run as the account whose config dir is ~/.claude-personal
+#                      (sets CLAUDE_CONFIG_DIR); `--account claude` is the default
+#                      account (unsets it). Without the flag, an inherited
+#                      CLAUDE_CONFIG_DIR is left alone.
 #
 # All other arguments are passed straight through to `claude`.
 #
@@ -17,15 +22,77 @@ set -euo pipefail
 HARNESS_DIR="${CLAUDEX_HARNESS_DIR:-$HOME/.claude/harness}"
 TRUSTED_ROOTS="${CLAUDEX_TRUSTED_ROOTS:-$HOME/.claude/harness-trusted-roots.txt}"
 
-# --- parse args: consume --strict, pass the rest through --------------------
+# --- parse args: consume --strict/--account, pass the rest through ----------
 strict=0
+account=""
+account_set=0
 pass_args=()
-for arg in "$@"; do
-  case "$arg" in
-    --strict) strict=1 ;;
-    *)        pass_args+=("$arg") ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --strict)    strict=1 ;;
+    --account=*) account="${1#--account=}"; account_set=1 ;;
+    --account)
+      if [ $# -lt 2 ]; then
+        echo "claudex: --account needs a name, e.g. --account claude-personal" >&2
+        exit 2
+      fi
+      account="$2"
+      account_set=1
+      shift
+      ;;
+    *)           pass_args+=("$1") ;;
   esac
+  shift
 done
+
+# --- pick the account: its config dir holds the login, plugins, history -----
+# Only `claude` or `claude-<name>` so the flag can't point claude at an
+# arbitrary dotdir, and the dir must already exist: a typo would otherwise
+# start a fresh, logged-out config instead of failing here.
+#
+# With CLAUDE_CONFIG_DIR set, Claude Code "keys the macOS Keychain entry to that
+# directory too, so a session with a different CLAUDE_CONFIG_DIR reads a
+# different entry" (docs: Authentication > Credential management). The key is
+# the literal string, and the default login is used only when the variable is
+# unset, so:
+#   - the default account unsets it. CLAUDE_CONFIG_DIR=$HOME/.claude is a
+#     *different*, empty login (`claude auth status`: loggedIn false).
+#   - a named account gets exactly "$HOME/.<name>", no realpath or trailing
+#     slash, to match what a `CLAUDE_CONFIG_DIR=$HOME/.<name> claude` alias
+#     stored at login; and the name must match the dir entry's exact case,
+#     since macOS's case-insensitive APFS would let `-d` accept a case typo
+#     that then reads a logged-out entry on top of the real account's files.
+if [ "$account_set" -eq 1 ]; then
+  case "$account" in
+    */*) account_ok=0 ;;
+    claude|claude-*) account_ok=1 ;;
+    *) account_ok=0 ;;
+  esac
+  if [ "$account_ok" -eq 0 ]; then
+    echo "claudex: --account '$account' is not an account name (claude or claude-<name>)." >&2
+    exit 2
+  fi
+  if [ "$account" = "claude" ]; then
+    unset CLAUDE_CONFIG_DIR
+  else
+    account_found=0
+    for d in "$HOME"/.claude-*; do
+      if [ -d "$d" ] && [ "${d##*/}" = ".$account" ]; then
+        account_found=1
+      fi
+    done
+    if [ "$account_found" -eq 0 ]; then
+      echo "claudex: --account $account: no config dir at $HOME/.$account" >&2
+      exit 1
+    fi
+    export CLAUDE_CONFIG_DIR="$HOME/.$account"
+  fi
+fi
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  account_desc="$CLAUDE_CONFIG_DIR"
+else
+  account_desc="$HOME/.claude (default)"
+fi
 
 if [ "$strict" -eq 1 ]; then
   template="$HARNESS_DIR/sandbox.strict.json"
@@ -71,13 +138,32 @@ done < <(python3 "$compose" "$template" "$roots_arg" "$settings_file")
 # into the wrapper's documented preserve hatch, and always say out loud which
 # source won. CLAUDEX_NO_AUTH_PASSTHROUGH=1 defers to the wrapper's scrub.
 auth_env_set=""
+cred_env_set=""
 for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
-         CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+         CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
+         ANTHROPIC_PROFILE \
          ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_BASE_URL; do
   if [ -n "${!v:-}" ]; then
     auth_env_set="${auth_env_set:+$auth_env_set }$v"
+    case "$v" in
+      ANTHROPIC_MODEL|ANTHROPIC_SMALL_FAST_MODEL|ANTHROPIC_BASE_URL) ;;
+      *) cred_env_set="${cred_env_set:+$cred_env_set }$v" ;;
+    esac
   fi
 done
+# Federation credentials only apply when both halves are set.
+if [ -n "${ANTHROPIC_FEDERATION_RULE_ID:-}" ] && [ -n "${ANTHROPIC_ORGANIZATION_ID:-}" ]; then
+  auth_env_set="${auth_env_set:+$auth_env_set }ANTHROPIC_FEDERATION_RULE_ID+ANTHROPIC_ORGANIZATION_ID"
+  cred_env_set="${cred_env_set:+$cred_env_set }ANTHROPIC_FEDERATION_RULE_ID+ANTHROPIC_ORGANIZATION_ID"
+fi
+
+# Credentials in the environment outrank a config dir's cached login, so
+# --account alone would still bill whatever key is exported: the exact
+# wrong-account run the flag exists to prevent, with nothing on screen.
+if [ "$account_set" -eq 1 ] && [ -n "$cred_env_set" ]; then
+  echo "claudex: warning: --account $account uses the login cached in $account_desc, but" >&2
+  echo "        $cred_env_set in your environment takes precedence over it. Unset to use the account." >&2
+fi
 
 if [ -n "$auth_env_set" ]; then
   auth_source="env ($auth_env_set)"
@@ -105,6 +191,7 @@ if [ "$strict" -eq 1 ]; then
 else
   echo "claudex: sandbox on; writes → project+temp (+trusted roots); network open. Use --strict to lock down." >&2
 fi
+echo "claudex: account → $account_desc" >&2
 echo "claudex: auth → $auth_source" >&2
 
 # Run as a child (not exec) so the temp settings dir is cleaned up on exit.
