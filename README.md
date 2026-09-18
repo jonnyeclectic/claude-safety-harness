@@ -321,7 +321,13 @@ keep things, so they do not count as throwaway.
   When on it matters because the sandbox does **not** cover the built-in file tools.
 - **`nudge-tests.py`** — `Stop` hook. If you edited source and no test/check ran after, it
   nudges once (auto-detects `make`/`pytest`/`npm test`/`cargo`/`go test`/`tox`/`gradle`/
-  `mvn`). Silent on Q&A / docs-only / already-tested turns; loop-guarded.
+  `mvn`, **and checked-in runners invoked as scripts** — `./bin/check.sh`,
+  `bash bin/check.sh`, `./scripts/test.sh`, `./run-tests.sh`). Silent on Q&A /
+  docs-only / already-tested turns. It nudges **once per set of untested edits**:
+  a nudge already in the transcript suppresses the next one until new code is
+  edited, so answering "tests aren't applicable here" ends it. `stop_hook_active`
+  alone is not enough — it only silences the immediate re-block, which is what
+  let an earlier version re-fire at every later stop.
 
 Every `deny`/`ask` is logged to `~/.claude/harness-audit.log` (JSONL) so you can tune the
 regex lists in `guard-bash.py` (`DENY_RULES`, `GRAY_RULES`) from real usage.
