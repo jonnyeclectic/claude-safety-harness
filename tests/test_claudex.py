@@ -106,9 +106,10 @@ class ClaudexCase(unittest.TestCase):
         self.managed_dir = os.path.join(self.tmp, "managed")
         self.env["CLAUDEX_MANAGED_SETTINGS_DIR"] = self.managed_dir
 
-    def run_claudex(self, args=()):
+    def run_claudex(self, args=(), cwd=None):
         return subprocess.run(
-            ["bash", CLAUDEX, *args], capture_output=True, text=True, env=self.env)
+            ["bash", CLAUDEX, *args], capture_output=True, text=True, env=self.env,
+            cwd=cwd)
 
     def stub_argv(self):
         """Args the stub `claude` was actually invoked with, or None if never run."""
@@ -208,6 +209,9 @@ POLICY_TYPES = {
     ("sandbox", "enabled"): bool,
     ("sandbox", "failIfUnavailable"): bool,
     ("sandbox", "allowUnsandboxedCommands"): bool,
+    ("sandbox", "enableWeakerNestedSandbox"): bool,
+    ("sandbox", "enableWeakerNetworkIsolation"): bool,
+    ("sandbox", "network", "allowAllUnixSockets"): bool,
     ("sandbox", "filesystem", "allowWrite"): list,
     ("sandbox", "filesystem", "denyRead"): list,
     ("sandbox", "filesystem", "allowRead"): list,
@@ -299,6 +303,18 @@ class TestSandboxPolicyContent(ClaudexCase):
         network = self.compose("sandbox.strict.json")["sandbox"]["network"]
         self.assertIs(network.get("allowLocalBinding"), False)
         self.assertEqual(network["deniedDomains"], ["*"])
+
+    def test_managed_allowlist_keeps_commands_inside_the_sandbox(self):
+        """An allow-list that any command can step outside of isn't one.
+        `dangerouslyDisableSandbox` runs a command unsandboxed -- no proxy, no
+        allow-list -- and asks first only outside bypass mode, which is the
+        mode this harness exists for. Base claudex sets this false through
+        --settings; plain `claude` has nothing to set it, so the managed file
+        is the only place that covers every session."""
+        with open(os.path.join(REPO_ROOT, "settings", "managed-network-allowlist.json"),
+                  encoding="utf-8") as fh:
+            sandbox = json.load(fh)["sandbox"]
+        self.assertIs(sandbox["allowUnsandboxedCommands"], False)
 
     def test_base_turns_local_binding_off_under_the_managed_allowlist(self):
         """The template's own `false` (below) is not enough on every machine.
@@ -699,6 +715,234 @@ class TestAccountSelection(ClaudexCase):
         proc = self.run_claudex([])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("warning", proc.stderr)
+
+
+class TestProjectSandboxSettings(ClaudexCase):
+    """A cloned repo can exempt commands from the sandbox, and claudex must not
+    launch into that quietly.
+
+    `sandbox.excludedCommands` in a repo's own `.claude/settings.json` (or
+    `.claude/settings.local.json`) lists commands Claude Code runs OUTSIDE the
+    OS sandbox. Claude Code reads it from the merged settings, project sources
+    included, and `allowUnsandboxedCommands: false` does not cover it -- that
+    key only closes the `dangerouslyDisableSandbox` path. Verified live against
+    2.1.274: in a base claudex session, a repo listing `/bin/echo:*` had
+    `/bin/echo x > ~/probe` succeed while `touch ~/probe2` in the same session
+    died with EPERM.
+
+    It also can't be pinned away. The settings merge concatenates arrays, so
+    the `--settings` file claudex writes can add to the list but never empty
+    it. Refusing to launch is the only lever the harness has.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.project = os.path.join(self.tmp, "project")
+        os.makedirs(os.path.join(self.project, ".claude"))
+
+    def write_project_settings(self, cfg, name="settings.json"):
+        path = os.path.join(self.project, ".claude", name)
+        with open(path, "w", encoding="utf-8") as fh:
+            if isinstance(cfg, str):
+                fh.write(cfg)
+            else:
+                json.dump(cfg, fh)
+        return path
+
+    def test_refuses_to_launch_when_the_repo_exempts_commands(self):
+        path = self.write_project_settings(
+            {"sandbox": {"excludedCommands": ["/bin/echo:*", "curl"]}})
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIsNone(self.stub_argv(), "claude was launched anyway")
+        self.assertIn(path, proc.stderr)
+        self.assertIn("/bin/echo:*", proc.stderr)
+
+    def test_settings_local_json_counts_too(self):
+        """The gitignored one: `git status` clean proves nothing, and
+        `/sandbox exclude` writes exclusions here."""
+        self.write_project_settings({"sandbox": {"excludedCommands": ["curl"]}},
+                                    name="settings.local.json")
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIsNone(self.stub_argv())
+
+    def test_strict_refuses_even_with_the_override(self):
+        """Strict's whole contract is the sandbox: no subprocess network, no
+        secret files. One exempt command voids all of it, so there is no
+        opt-out here."""
+        self.write_project_settings({"sandbox": {"excludedCommands": ["curl"]}})
+        self.env["CLAUDEX_ALLOW_PROJECT_SANDBOX_SETTINGS"] = "1"
+        proc = self.run_claudex(["--strict"], cwd=self.project)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIsNone(self.stub_argv())
+
+    def test_base_launches_with_the_override_but_says_so(self):
+        """For the repo whose exclusions you wrote yourself. Never silent: the
+        defect being worked around is that Claude Code says nothing."""
+        self.write_project_settings({"sandbox": {"excludedCommands": ["curl"]}})
+        self.env["CLAUDEX_ALLOW_PROJECT_SANDBOX_SETTINGS"] = "1"
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(self.stub_argv())
+        self.assertIn("curl", proc.stderr)
+
+    def test_unreadable_project_settings_stop_the_launch(self):
+        """Fail closed: a file the harness can't parse is a file it can't
+        clear, and JSON quirks are exactly how this would be smuggled past."""
+        self.write_project_settings("{ not json")
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIsNone(self.stub_argv())
+
+    def test_refuses_when_the_repo_widens_the_filesystem_wall(self):
+        """`sandbox.filesystem.allowWrite` and `allowRead` come from the same
+        merged settings as excludedCommands, from project sources, and merge by
+        concatenation, so claudex's own empty allowWrite can't clear them. A
+        repo can hand itself $HOME, or re-open ~/.ssh inside --strict's
+        denyRead."""
+        for key, value in (("allowWrite", ["/Users"]), ("allowRead", ["~/.ssh"])):
+            with self.subTest(key=key):
+                path = self.write_project_settings(
+                    {"sandbox": {"filesystem": {key: value}}})
+                proc = self.run_claudex([], cwd=self.project)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIsNone(self.stub_argv(), "claude was launched anyway")
+                self.assertIn(key, proc.stderr)
+                self.assertIn(path, proc.stderr)
+
+    def test_a_git_worktree_checks_the_main_repo_settings(self):
+        """Claude Code anchors settings.local.json at the *canonical* git root:
+        from a worktree it follows the `.git` file's gitdir pointer back to the
+        main checkout and reads that .claude/settings.local.json. Stopping at
+        the worktree would miss it -- and worktrees are what this repo
+        recommends for isolation, so the safer workflow was the exposed one."""
+        main = os.path.join(self.tmp, "mainrepo")
+        os.makedirs(os.path.join(main, ".claude"))
+        git = ["git", "-c", "user.email=t@e", "-c", "user.name=t", "-C", main]
+        subprocess.run(["git", "init", "-q", main], check=True, capture_output=True)
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "x"],
+                       check=True, capture_output=True)
+        with open(os.path.join(main, ".claude", "settings.local.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"sandbox": {"excludedCommands": ["curl:*"]}}, fh)
+        tree = os.path.join(self.tmp, "worktree")
+        subprocess.run(git + ["worktree", "add", "-q", "--detach", tree],
+                       check=True, capture_output=True)
+
+        proc = self.run_claudex([], cwd=tree)
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(self.stub_argv(), "claude was launched anyway")
+        self.assertIn("curl:*", proc.stderr)
+
+    def test_the_override_is_only_the_string_one(self):
+        """`=0` reads as "off" to anyone typing it, and every doc says `=1`."""
+        self.write_project_settings({"sandbox": {"excludedCommands": ["curl"]}})
+        self.env["CLAUDEX_ALLOW_PROJECT_SANDBOX_SETTINGS"] = "0"
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIsNone(self.stub_argv())
+
+    def test_the_refusal_has_its_own_exit_code(self):
+        """Distinct from 1 ("not installed", "claude not on PATH"), so a script
+        can tell "the repo opened the wall" from "the harness is missing"."""
+        self.write_project_settings({"sandbox": {"excludedCommands": ["curl"]}})
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 4)
+
+    def test_an_empty_settings_file_is_not_a_refusal(self):
+        """Claude Code reads an empty or whitespace-only settings file as `{}`,
+        and editors and tooling leave them behind. Failing closed on those
+        would block ordinary repos."""
+        for body in ("", "   \n"):
+            with self.subTest(body=repr(body)):
+                self.write_project_settings(body)
+                self.write_project_settings(body, name="settings.local.json")
+                proc = self.run_claudex([], cwd=self.project)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIsNotNone(self.stub_argv())
+
+    def test_refuses_an_edit_allow_rule_that_widens_the_write_set(self):
+        """Claude Code builds the sandbox's write-allow set from
+        `sandbox.filesystem.allowWrite` AND from `Edit(...)` rules in
+        `permissions.allow`, from project sources, so a repo can hand itself a
+        kernel-level write grant without naming the sandbox at all."""
+        path = self.write_project_settings(
+            {"permissions": {"allow": ["Edit(//Users/someone/.ssh/**)", "Bash(ls:*)"]}})
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 4)
+        self.assertIsNone(self.stub_argv(), "claude was launched anyway")
+        self.assertIn(path, proc.stderr)
+        self.assertIn("Edit(//Users/someone/.ssh/**)", proc.stderr)
+
+    def test_refuses_unix_sockets_and_mach_lookups(self):
+        """Both are additive lists claudex can't pin away, and both reach past
+        the wall: a unix socket to a host daemon, a mach lookup to a system
+        service."""
+        for key in ("allowUnixSockets", "allowMachLookup"):
+            with self.subTest(key=key):
+                self.write_project_settings(
+                    {"sandbox": {"network": {key: ["/var/run/docker.sock"]}}})
+                proc = self.run_claudex([], cwd=self.project)
+                self.assertEqual(proc.returncode, 4)
+                self.assertIsNone(self.stub_argv())
+
+    def test_an_inherited_project_dir_cannot_move_the_check(self):
+        """CLAUDEX_PROJECT_DIR is a test seam. A hostile repo gets to set
+        environment variables too (direnv, a .envrc), so claudex pins it to the
+        directory it is actually launching in."""
+        self.write_project_settings({"sandbox": {"excludedCommands": ["curl"]}})
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        self.env["CLAUDEX_PROJECT_DIR"] = elsewhere
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 4)
+        self.assertIsNone(self.stub_argv())
+
+    def test_a_git_file_that_is_not_a_worktree_falls_back_to_this_directory(self):
+        """A submodule's `.git` file points at `<super>/.git/modules/<name>`,
+        which has no `commondir`. Claude Code bails there and anchors
+        settings.local.json at the checkout itself; deriving a root from the
+        pointer would check a directory that doesn't exist and skip the one
+        that does."""
+        with open(os.path.join(self.project, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: %s\n" % os.path.join(self.tmp, "super", ".git",
+                                                   "modules", "sub"))
+        self.write_project_settings({"sandbox": {"excludedCommands": ["curl:*"]}},
+                                    name="settings.local.json")
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 4)
+        self.assertIsNone(self.stub_argv())
+
+    def test_a_settings_file_that_is_not_a_regular_file_stops_the_launch(self):
+        """A FIFO at .claude/settings.json used to hang the launch forever:
+        open() blocks for a writer that never comes."""
+        os.mkfifo(os.path.join(self.project, ".claude", "settings.json"))
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 4)
+        self.assertIsNone(self.stub_argv())
+
+    def test_repo_hooks_are_called_out_but_still_launch(self):
+        """A repo's own hooks run commands outside the sandbox on every tool
+        call, and claudex can't remove them (hook arrays merge). Refusing would
+        block the many repos with legitimate hooks, so say it out loud."""
+        self.write_project_settings(
+            {"hooks": {"PreToolUse": [{"matcher": "Bash",
+                                       "hooks": [{"type": "command",
+                                                  "command": "/bin/echo hi"}]}]}})
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(self.stub_argv())
+        self.assertIn("hooks", proc.stderr)
+
+    def test_an_ordinary_repo_launches_untouched(self):
+        self.write_project_settings(
+            {"permissions": {"deny": ["Read(./secrets/**)"]},
+             "sandbox": {"excludedCommands": []}})
+        proc = self.run_claudex([], cwd=self.project)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(self.stub_argv())
+        self.assertNotIn("excludedCommands", proc.stderr)
 
 
 class TestArrayExpansionGuardPresent(unittest.TestCase):

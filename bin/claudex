@@ -122,9 +122,20 @@ settings_file="$workdir/settings.json"
 add_dirs=()
 roots_arg="$TRUSTED_ROOTS"
 [ -f "$roots_arg" ] || roots_arg="NONE"
+# Run compose through a file, not a process substitution: it exits 4 when the
+# project's own settings widen the sandbox, and a `done < <(...)` pipeline
+# throws that status away -- claudex would launch a session whose wall the repo
+# had already opened. The 4 is passed straight through, so a caller can tell it
+# from claudex's own exit 1 ("not installed", "claude not on PATH").
+roots_out="$workdir/trusted-roots.txt"
+# CLAUDEX_PROJECT_DIR is pinned, not inherited: a hostile repo gets to set
+# environment variables too (direnv, a .envrc), and pointing the check at an
+# empty directory would be the cheapest way past it.
+CLAUDEX_PROJECT_DIR="$PWD" CLAUDEX_STRICT="$strict" \
+  python3 "$compose" "$template" "$roots_arg" "$settings_file" > "$roots_out" || exit $?
 while IFS= read -r d; do
   [ -n "$d" ] && add_dirs+=(--add-dir "$d")
-done < <(python3 "$compose" "$template" "$roots_arg" "$settings_file")
+done < "$roots_out"
 
 # --- keep the caller's Anthropic auth context reaching `claude` -------------
 # Terminal integrations put their own shim in front of `claude`, and some of

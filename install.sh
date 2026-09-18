@@ -26,14 +26,26 @@ die()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # Optional: install the global managed allow-list (needs root; see template).
 # ---------------------------------------------------------------------------
-install_managed_allowlist() {
+# The directory Claude Code reads file-based managed settings from.
+# CLAUDEX_MANAGED_SETTINGS_DIR replaces it, which is how the tests exercise
+# this path without root or a real /Library write; a replaced directory needs
+# no sudo, since it is somewhere the caller can already write.
+managed_settings_dir() {
+  if [ -n "${CLAUDEX_MANAGED_SETTINGS_DIR:-}" ]; then
+    printf '%s\n' "$CLAUDEX_MANAGED_SETTINGS_DIR"
+    return 0
+  fi
   [ "$(id -u)" -eq 0 ] || die "--managed-allowlist must be run with sudo."
-  local src="$REPO_DIR/settings/managed-network-allowlist.json" dest
   case "$(uname -s)" in
-    Darwin) dest="/Library/Application Support/ClaudeCode/managed-settings.json" ;;
-    Linux)  dest="/etc/claude-code/managed-settings.json" ;;
+    Darwin) printf '%s\n' "/Library/Application Support/ClaudeCode" ;;
+    Linux)  printf '%s\n' "/etc/claude-code" ;;
     *)      die "Unsupported OS for managed settings: $(uname -s)" ;;
   esac
+}
+
+install_managed_allowlist() {
+  local src="$REPO_DIR/settings/managed-network-allowlist.json" dest
+  dest="$(managed_settings_dir)/managed-settings.json"
   if [ -e "$dest" ]; then
     die "$dest already exists. Merge the network block from
        $src by hand so existing managed policy isn't clobbered."
@@ -64,15 +76,17 @@ case "$(uname -s)" in
 esac
 
 # Fail fast if ~/.claude isn't writable. The usual cause is running install.sh
-# INSIDE a sandboxed `claudex` session (e.g. via the `!` prefix), where writes to
-# ~/.claude are kernel-denied — otherwise this surfaces much later as a cryptic
-# `cp: Operation not permitted` after the plugin step has already half-run.
+# from inside a sandboxed `claudex` session -- a Bash tool call, or a nested
+# claudex -- where writes to ~/.claude are kernel-denied; otherwise this
+# surfaces much later as a cryptic `cp: Operation not permitted` after the
+# plugin step has already half-run. (Commands typed at the `!` prompt are NOT
+# sandboxed as of Claude Code 2.1.260, so those are not the cause.)
 mkdir -p "$CLAUDE_DIR" 2>/dev/null || true
 _probe="$CLAUDE_DIR/.harness-install-probe.$$"
 if ! touch "$_probe" 2>/dev/null; then
   die "Cannot write to $CLAUDE_DIR — install.sh looks like it is running inside a
-       sandboxed claudex session. Run it from a NORMAL terminal (do not use the
-       '!' prefix inside claudex)."
+       sandboxed claudex session (a Bash tool call, or a nested claudex). Run it
+       from a normal terminal."
 fi
 rm -f "$_probe"
 
