@@ -3,6 +3,9 @@
     "enabled": true,
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
+    "_comment3": "enableWeakerNestedSandbox and enableWeakerNetworkIsolation are pinned false, and allowAllUnixSockets below with them: a repo's own .claude/settings.json can set all three, and this --settings file outranks project and local settings for a scalar. The list-valued siblings (network.allowUnixSockets, network.allowMachLookup) cannot be pinned this way -- arrays merge -- so compose-settings.py refuses to launch when a project sets those.",
+    "enableWeakerNestedSandbox": false,
+    "enableWeakerNetworkIsolation": false,
     "filesystem": {
       "allowWrite": [],
       "denyRead": [
@@ -37,6 +40,7 @@
       ]
     },
     "network": {
+      "allowAllUnixSockets": false,
       "_comment": "allowLocalBinding false is pinned, not merely left out: a repo's own .claude/settings.json may set it, and on macOS true lets a subprocess connect() to localhost without the proxy that enforces deniedDomains ['*']. This --settings file outranks project and local settings.",
       "allowLocalBinding": false,
       "deniedDomains": ["*"]

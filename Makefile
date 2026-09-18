@@ -30,4 +30,4 @@ lint:
 	PYTHONPYCACHEPREFIX=$${TMPDIR:-/tmp}/harness-pyc \
 		$(PYTHON) -m compileall -q hooks tests
 	PYTHONPYCACHEPREFIX=$${TMPDIR:-/tmp}/harness-pyc \
-		$(PYTHON) -m py_compile bin/ghapi bin/compose-settings.py
+		$(PYTHON) -m py_compile bin/ghapi bin/compose-settings.py bin/is-harness-allowlist.py

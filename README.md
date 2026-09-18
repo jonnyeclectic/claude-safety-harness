@@ -71,7 +71,8 @@ claudex --account claude-personal   # run as the ~/.claude-personal account
 claudex -p "…"      # any extra args pass straight through to `claude`
 ```
 
-What each mode enforces (all **verified** against Claude Code 2.1.273 on macOS):
+What each mode enforces (verified against Claude Code 2.1.274 on macOS, except where a
+row says otherwise):
 
 | | `claudex` | `claudex --strict` |
 |---|---|---|
@@ -273,6 +274,12 @@ allow-list never sees.
   covers allow-lists installed before the template had the line. It only sees an allow-list
   installed as a local managed file, the kind `install.sh` writes; one pushed through MDM
   or server-managed settings needs `allowLocalBinding: false` in that same source.
+
+The template also sets `allowUnsandboxedCommands: false`, so the model can't step outside
+the sandbox (and past the proxy) with `dangerouslyDisableSandbox`. Base `claudex` already
+sets that through `--settings`; plain `claude` has nothing that does. Like the `false`
+above it, this applies while `managed-settings.json` is the managed source Claude Code
+applies. (Commands you type at the `!` prompt are outside all of this — see Limitations.)
 
 The cost: with the allow-list installed, sandboxed commands on macOS can't bind a local
 port (dev servers, Playwright, `jest --watch`). Linux ignores `allowLocalBinding` either
@@ -478,6 +485,32 @@ Restore from a normal terminal first, then `dotnet test --no-restore` inside the
   accept connections from your LAN. None of that traverses the egress proxy or records a
   violation. `--strict` pins it off (that's the profile for code you don't trust), and so
   does the managed allow-list.
+- **A repo's own settings can widen the sandbox, and `--settings` can't take it back.**
+  In `.claude/settings.json` or the gitignored `.claude/settings.local.json`, Claude Code
+  honors `sandbox.excludedCommands` (commands it runs **outside** the sandbox — no
+  filesystem wall, no proxy), `sandbox.filesystem.allowWrite` (host paths a subprocess may
+  write) and `sandbox.filesystem.allowRead` (paths re-opened inside `--strict`'s denyRead,
+  `~/.ssh` included). `allowUnsandboxedCommands: false` doesn't cover any of it, and the
+  settings merge concatenates arrays, so claudex can add to each list but never empty it.
+  The same goes for `sandbox.network.allowUnixSockets` and `allowMachLookup`, and for
+  `Edit(...)` rules in `permissions.allow` — Claude Code builds the sandbox's write-allow
+  set from those too, so `Edit(//Users/you/.ssh/**)` is a kernel-level write grant with no
+  mention of the sandbox at all.
+  `claudex` therefore **refuses to launch** (exit 4) when it finds one, naming the file and
+  the values. It checks `settings.json` at the launch directory and
+  `settings.local.json` at both the launch directory and the canonical git root, following
+  a worktree's `.git` pointer back to the main checkout the way Claude Code does. Base mode
+  takes `CLAUDEX_ALLOW_PROJECT_SANDBOX_SETTINGS=1` (loudly) for repos whose settings are
+  yours; `--strict` has no override. The scalar siblings — `enableWeakerNestedSandbox`,
+  `enableWeakerNetworkIsolation`, `network.allowAllUnixSockets` — need no refusal: both
+  policy files pin them `false`, and `--settings` outranks a repo for a scalar.
+- **A repo's own hooks run outside the sandbox** on every tool call, and hook lists merge
+  like the rest, so claudex can't remove them either. Refusing would block the many repos
+  with legitimate hooks, so `claudex` names the file on stderr and launches. Read them
+  before you trust a clone.
+- **Commands you type at the `!` prompt are not sandboxed**, by design since Claude Code
+  2.1.260 — they run like your own terminal, whatever the policy file says. The wall is
+  around what the *model* runs.
 - For fully unattended runs, prefer a container/VM (e.g. Anthropic's devcontainer with its
   iptables egress firewall) — that isolates the kernel and network, which no host-level
   sandbox can fully do.
@@ -488,6 +521,16 @@ Restore from a normal terminal first, then `dotnet test --no-restore` inside the
 ./uninstall.sh                        # remove launcher + policy files + plugin
 sudo ./uninstall.sh --managed-allowlist   # if you installed the global allow-list
 ```
+
+`--managed-allowlist` only deletes a managed-settings.json that holds this repo's
+allow-list and nothing else. If your company's MDM put hooks, MCP policy, login rules or
+their own sandbox denies in the same file — or you merged our block into theirs by hand, as
+the section above says — it refuses and names what else is in there, so removing our
+allow-list can't quietly remove their policy from every session; remove our keys by hand in
+that case. It also checks the `_installedBy` marker the template carries, because a
+company's own Claude Code allow-list has the same key names as ours. Values aren't
+compared, so editing `allowedDomains` (which the section above tells you to do) still
+leaves the file ours to remove.
 
 Your `~/.claude/harness-trusted-roots.txt` and `~/.claude/harness-audit.log` are left in
 place; delete them by hand if you want them gone.
