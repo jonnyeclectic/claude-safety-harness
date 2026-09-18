@@ -30,6 +30,12 @@ import unittest
 
 HOOKS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "hooks")
+
+# The Stop-hook nudge's first sentence. nudge-tests.py looks for this in the
+# transcript to tell whether it already nudged for the current edits. Split
+# across two lines on purpose -- see the comment on the hook's own copy.
+NUDGE_MARKER = ("Harness check: source files were modified but no tests ran "
+                "afterward.")
 sys.path.insert(0, HOOKS)
 
 import harness_common  # noqa: E402
@@ -978,11 +984,22 @@ class TestNudgeTests(HookCase):
         super().tearDown()
 
     def nudge(self, events, stop_hook_active=False):
-        """events: list of ("edit", relpath|abspath) / ("test", command).
-        Returns "block" (nudge fired) or "allow" (silent)."""
+        """events: list of ("edit", relpath|abspath) / ("test", command) /
+        ("nudge", None). The last replays a nudge this hook already delivered,
+        in the exact record shape Claude Code writes to the transcript.
+        Returns "block" (nudge fired) or "allow" (silent); a block's reason text
+        is left on self.last_reason."""
         tpath = os.path.join(self.home, "transcript.jsonl")
         with open(tpath, "w", encoding="utf-8") as fh:
             for kind, val in events:
+                if kind == "nudge":
+                    fh.write(json.dumps({
+                        "type": "user", "isMeta": True,
+                        "message": {"role": "user",
+                                    "content": "Stop hook feedback:\n"
+                                               + NUDGE_MARKER},
+                    }) + "\n")
+                    continue
                 if kind == "edit":
                     p = val if os.path.isabs(val) else os.path.join(self.proj, val)
                     tu = {"type": "tool_use", "name": "Write",
@@ -998,7 +1015,12 @@ class TestNudgeTests(HookCase):
             capture_output=True, text=True, env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         out = proc.stdout.strip()
-        return json.loads(out)["decision"] if out else "allow"
+        if not out:
+            self.last_reason = ""
+            return "allow"
+        payload = json.loads(out)
+        self.last_reason = payload.get("reason", "")
+        return payload["decision"]
 
     # --- fires (real code went untested) ------------------------------------
 
@@ -1041,6 +1063,124 @@ class TestNudgeTests(HookCase):
         # install under ~/.claude) is not this project's source -> no nudge.
         self.assertEqual(
             self.nudge([("edit", os.path.join(self.home, "s.py"))]), "allow")
+
+    # --- does NOT fire: already nudged, nothing new since (the loop bug) ------
+
+    def test_prior_nudge_suppresses_repeat(self):
+        """The reported loop: stop_hook_active only silences the *immediate*
+        re-block, so once an untested edit existed the nudge re-fired at EVERY
+        later stop -- 64 times in one real session. A nudge already delivered
+        with no code edit after it must stay silent."""
+        self.assertEqual(
+            self.nudge([("edit", "src/app.py"), ("nudge", None)]), "allow")
+
+    def test_new_edit_after_nudge_rearms(self):
+        # Suppression is per edit-set, not per session: fresh code after the
+        # nudge must nudge again.
+        self.assertEqual(
+            self.nudge([("edit", "a.py"), ("nudge", None), ("edit", "b.py")]),
+            "block")
+
+    def test_test_run_after_nudge_stays_silent(self):
+        self.assertEqual(
+            self.nudge([("edit", "a.py"), ("nudge", None), ("test", "make check")]),
+            "allow")
+
+    # --- project-local test runners count as a test run ----------------------
+
+    def test_project_local_check_script_counts(self):
+        """environment-bootstrap's real suite is ./bin/check.sh. It ran 8 times
+        in the looping session and the regex matched none of them, so last_test
+        never advanced and the nudge could never clear."""
+        for cmd in ("./bin/check.sh", "bin/check.sh", "bash bin/check.sh",
+                    "sh ./bin/check.sh", "./check.sh", "./test.sh",
+                    "./scripts/test.sh", "./run-tests.sh"):
+            self.assertEqual(
+                self.nudge([("edit", "install.sh"), ("test", cmd)]), "allow", cmd)
+
+    def test_check_script_inside_compound_command_counts(self):
+        # How it is really invoked: cd, then piped through tail.
+        self.assertEqual(
+            self.nudge([("edit", "install.sh"),
+                        ("test", "cd /tmp/x\n./bin/check.sh 2>&1 | tail -5")]),
+            "allow")
+
+    def test_env_prefixed_runner_counts(self):
+        """Found by replaying a real session: `CHECK_REHEARSAL=1 UV_CACHE_DIR=...
+        ./bin/check.sh` ran the actual suite, but the leading assignments pushed
+        the script out of command position and it was missed -- the same class of
+        bug as the original."""
+        for cmd in ('CHECK_REHEARSAL=1 ./bin/check.sh',
+                    'CHECK_REHEARSAL=1 UV_CACHE_DIR="$TMPDIR/uv" ./bin/check.sh 2>&1 | grep -E x',
+                    "FOO=bar env BAZ=1 ./bin/check.sh",
+                    "time ./bin/check.sh",
+                    "CI=1 make check"):
+            self.assertEqual(
+                self.nudge([("edit", "install.sh"), ("test", cmd)]), "allow", cmd)
+
+    def test_python_runner_counts(self):
+        for cmd in ("./bin/check.py", "python3 scripts/test.py", "./run-tests.py"):
+            self.assertEqual(
+                self.nudge([("edit", "install.sh"), ("test", cmd)]), "allow", cmd)
+
+    def test_make_with_flags_and_node_test_count(self):
+        for cmd in ("make -C tests check", "make -s test", "node --test"):
+            self.assertEqual(
+                self.nudge([("edit", "a.js"), ("test", cmd)]), "allow", cmd)
+
+    def test_lint_only_is_not_a_test_run(self):
+        # shellcheck / `bash -n` are static analysis: they do not show the change
+        # preserved behaviour, so they must NOT clear the nudge.
+        for cmd in ("shellcheck --severity=warning bin/check.sh",
+                    "bash -n bin/check.sh"):
+            self.assertEqual(
+                self.nudge([("edit", "install.sh"), ("test", cmd)]), "block", cmd)
+
+    def test_echo_test_is_not_a_test_run(self):
+        # A writability probe contains the word "test" but runs nothing.
+        self.assertEqual(
+            self.nudge([("edit", "install.sh"),
+                        ("test", "echo test > assets/_t && rm assets/_t")]),
+            "block")
+
+    def test_nudge_names_the_project_local_runner(self):
+        # The nudge must name a command its own regex will recognise, or the
+        # user runs what it asked for and gets nudged again anyway.
+        os.makedirs(os.path.join(self.proj, "bin"), exist_ok=True)
+        with open(os.path.join(self.proj, "bin", "check.sh"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        self.assertEqual(self.nudge([("edit", "install.sh")]), "block")
+        self.assertIn("./bin/check.sh", self.last_reason)
+
+    def test_bats_glob_is_not_a_test_run(self):
+        # `find ... -name '*.bats'` is a search for test infra, not a run of it.
+        # This was the one command a real 527-command session matched.
+        self.assertEqual(
+            self.nudge([("edit", "a.py"),
+                        ("test", "find . -name '*.bats' -o -name 'Makefile'")]),
+            "block")
+        self.assertEqual(
+            self.nudge([("edit", "a.py"), ("test", "bats tests/")]), "allow")
+
+    def test_marker_is_not_present_in_our_own_sources(self):
+        """The suppression marker must never appear on a single line of the hook
+        or of this file. If it did, reading either into the transcript (`cat`,
+        Read, a grep hit) would look like a nudge already delivered and silence
+        the hook for the rest of the session."""
+        for path in (os.path.join(HOOKS, "nudge-tests.py"),
+                     os.path.abspath(__file__)):
+            with open(path, encoding="utf-8") as fh:
+                for n, line in enumerate(fh, 1):
+                    self.assertNotIn(NUDGE_MARKER, line, f"{path}:{n}")
+
+    def test_partial_marker_does_not_suppress(self):
+        # A transcript carrying only the marker's first half -- what reading the
+        # hook's source actually puts there -- must still nudge.
+        half = "Harness check: source files were modified but no tests ran "
+        self.assertEqual(
+            self.nudge([("edit", "a.py"), ("test", "cat hooks/nudge-tests.py"),
+                        ("test", "echo " + half)]),
+            "block")
 
     def test_stop_hook_active_does_not_loop(self):
         self.assertEqual(
