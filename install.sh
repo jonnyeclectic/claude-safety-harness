@@ -43,6 +43,8 @@ install_managed_allowlist() {
   ok "Installed global managed allow-list → $dest"
   warn "This restricts EVERY claude session (plain claude + base claudex too),"
   warn "not just 'claudex --strict'. Remove the file to undo."
+  warn "On macOS it also stops sandboxed commands binding local ports (dev servers,"
+  warn "Playwright, jest --watch), so nothing reaches localhost around the allow-list."
 }
 
 if [ "${1:-}" = "--managed-allowlist" ]; then

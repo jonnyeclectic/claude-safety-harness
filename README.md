@@ -77,8 +77,8 @@ What each mode enforces (all **verified** against Claude Code 2.1.273 on macOS):
 |---|---|---|
 | Write outside project + temp | 🚫 blocked at syscall | 🚫 blocked at syscall |
 | Write inside project / temp / trusted roots | ✅ allowed | ✅ allowed |
-| Subprocess network (`curl`, `npm i`, `pip`, `git fetch`) | ✅ open | 🚫 blocked (`403` at the proxy) |
-| Bind a local port (dev servers, Playwright, `jest --watch`) — macOS | ✅ allowed | 🚫 blocked at syscall |
+| Subprocess network (`curl`, `npm i`, `pip`, `git fetch`) | ✅ open (allow-listed hosts only with the [managed allow-list](#optional-a-true-global-network-allow-list)) | 🚫 blocked (`403` at the proxy) |
+| Bind a local port (dev servers, Playwright, `jest --watch`) — macOS | ✅ allowed (off with the [managed allow-list](#optional-a-true-global-network-allow-list), per 2.1.274 source) | 🚫 blocked at syscall |
 | Read `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, … | ✅ readable | 🚫 blocked at syscall |
 | Secret env vars (`GITHUB_TOKEN`, `AWS_*`, `*_API_KEY`) in subprocesses | visible | 🚫 scrubbed to empty |
 | Built-in `Read`/`Edit` of the above secrets | (hook `ask` only) | 🚫 `permissions.deny` |
@@ -257,6 +257,35 @@ sudo ./install.sh --managed-allowlist    # writes the OS managed-settings.json
 and base `claudex` too), not just `--strict`. Edit `settings/managed-network-allowlist.json`
 first to set the domains you want. Undo with `sudo ./uninstall.sh --managed-allowlist`.
 
+The allow-list also turns local port binding off, in two places. Base `claudex` turns it
+on, and on macOS that lets a subprocess connect to localhost **without going through the
+egress proxy**, so any local proxy (`ssh -D`, a dev proxy) would carry traffic the
+allow-list never sees.
+
+- **The template sets `allowLocalBinding: false`.** Managed settings outrank the
+  `--settings` file `claudex` launches with, so this covers plain `claude` too, but only
+  while `managed-settings.json` is the managed source Claude Code applies. Server-managed
+  settings from your claude.ai organization, or an MDM profile, replace it unless they set
+  `managedSourcesBehavior: "merge"`. `/status` shows which source applies.
+- **`claudex` checks for itself.** At launch it reads `managed-settings.json` and
+  `managed-settings.d/*.json`, and if any of them turns the allow-list on it writes `false`
+  into its own settings. That holds whichever managed source Claude Code applies, and it
+  covers allow-lists installed before the template had the line. It only sees an allow-list
+  installed as a local managed file, the kind `install.sh` writes; one pushed through MDM
+  or server-managed settings needs `allowLocalBinding: false` in that same source.
+
+The cost: with the allow-list installed, sandboxed commands on macOS can't bind a local
+port (dev servers, Playwright, `jest --watch`). Linux ignores `allowLocalBinding` either
+way. Never add `localhost`, `127.0.0.1`, `::1` or `*` to `allowedDomains`: the proxy would
+then carry the same connections. (Precedence read from Claude Code 2.1.274's source, not
+yet run end to end.)
+
+For plain `claude` on an allow-list installed before this change, add
+`"allowLocalBinding": false` under `sandbox.network` in
+`/Library/Application Support/ClaudeCode/managed-settings.json` (needs `sudo`), then check
+it with `python3 -m json.tool` on that file. A managed file that isn't valid JSON stops
+every `claude` session from starting until it's fixed.
+
 ## The hooks (advisory layer)
 
 Deliberately small and auditable — three tiers, applied in **every** session (they're
@@ -390,7 +419,8 @@ They all follow from the sandbox doing its job, and none indicate a broken insta
 
 ### `dotnet test` needs two more things the sandbox can't give it
 
-`allowLocalBinding` gets the .NET test host past `bind()`, but on macOS two further
+In base `claudex` without the managed allow-list, `allowLocalBinding` gets the .NET test
+host past `bind()`, but on macOS two further
 blocks sit behind it. Both are Claude Code sandbox gaps, not harness settings, so there is
 nothing to flip here — these are the workarounds.
 
@@ -446,7 +476,8 @@ Restore from a normal terminal first, then `dotnet test --no-restore` inside the
   API, a `node --inspect` port (which is arbitrary code execution in an *unsandboxed*
   process, and therefore a way out of the filesystem wall). It can also bind `0.0.0.0` and
   accept connections from your LAN. None of that traverses the egress proxy or records a
-  violation. `--strict` does not set it; that's the profile for code you don't trust.
+  violation. `--strict` pins it off (that's the profile for code you don't trust), and so
+  does the managed allow-list.
 - For fully unattended runs, prefer a container/VM (e.g. Anthropic's devcontainer with its
   iptables egress firewall) — that isolates the kernel and network, which no host-level
   sandbox can fully do.
