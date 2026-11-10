@@ -985,13 +985,17 @@ class TestNudgeTests(HookCase):
 
     def nudge(self, events, stop_hook_active=False):
         """events: list of ("edit", relpath|abspath) / ("test", command) /
-        ("nudge", None). The last replays a nudge this hook already delivered,
+        ("nudge", None) / ("record", transcript_record).
+        The nudge event replays a nudge this hook already delivered,
         in the exact record shape Claude Code writes to the transcript.
         Returns "block" (nudge fired) or "allow" (silent); a block's reason text
         is left on self.last_reason."""
         tpath = os.path.join(self.home, "transcript.jsonl")
         with open(tpath, "w", encoding="utf-8") as fh:
             for kind, val in events:
+                if kind == "record":
+                    fh.write(json.dumps(val) + "\n")
+                    continue
                 if kind == "nudge":
                     fh.write(json.dumps({
                         "type": "user", "isMeta": True,
@@ -1081,6 +1085,34 @@ class TestNudgeTests(HookCase):
             self.nudge([("edit", "a.py"), ("nudge", None), ("edit", "b.py")]),
             "block")
 
+    def test_quoted_nudge_does_not_suppress(self):
+        # Reading or discussing the earlier warning is not a hook firing.
+        records = (
+            {"type": "assistant", "message": {"content": [{
+                "type": "tool_use", "name": "Bash",
+                "input": {"command": "echo '" + NUDGE_MARKER + "'"}}]}},
+            {"type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "read-warning",
+                "content": NUDGE_MARKER}]}},
+            {"type": "user", "message": {"role": "user",
+                "content": "Why did it say " + NUDGE_MARKER}},
+            {"type": "user", "isMeta": True, "message": {
+                "content": "Context containing a quote: " + NUDGE_MARKER}},
+        )
+        for record in records:
+            with self.subTest(record=record):
+                self.assertEqual(self.nudge([
+                    ("edit", "a.py"), ("record", record)]), "block")
+
+    def test_prior_hook_attachment_suppresses_repeat(self):
+        attachment = {"type": "attachment", "attachment": {
+            "type": "hook_blocking_error", "hookName": "Stop",
+            "hookEvent": "Stop", "blockingError": {
+                "blockingError": NUDGE_MARKER,
+                "command": "python3 hooks/nudge-tests.py"}}}
+        self.assertEqual(self.nudge([
+            ("edit", "a.py"), ("record", attachment)]), "allow")
+
     def test_test_run_after_nudge_stays_silent(self):
         self.assertEqual(
             self.nudge([("edit", "a.py"), ("nudge", None), ("test", "make check")]),
@@ -1163,10 +1195,7 @@ class TestNudgeTests(HookCase):
             self.nudge([("edit", "a.py"), ("test", "bats tests/")]), "allow")
 
     def test_marker_is_not_present_in_our_own_sources(self):
-        """The suppression marker must never appear on a single line of the hook
-        or of this file. If it did, reading either into the transcript (`cat`,
-        Read, a grep hit) would look like a nudge already delivered and silence
-        the hook for the rest of the session."""
+        """Keep the exact warning distinct from its source diagnostics."""
         for path in (os.path.join(HOOKS, "nudge-tests.py"),
                      os.path.abspath(__file__)):
             with open(path, encoding="utf-8") as fh:

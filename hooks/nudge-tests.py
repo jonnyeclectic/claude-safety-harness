@@ -56,15 +56,9 @@ PROJECT_TEST_RUN = re.compile(
     re.IGNORECASE,
 )
 
-# Our own block reason. Seeing it in the transcript means we already nudged; see
-# the module docstring for why that is the real guard.
-#
-# It deliberately runs to the end of the first sentence, and is deliberately
-# SPLIT across two source lines here. A shorter marker would appear verbatim in
-# this file and in the test suite, so `cat hooks/nudge-tests.py` would put it in
-# the transcript and silence the nudge for the rest of the session -- a false
-# negative, which is worse than the false positive this guard was added to fix.
-# tests/test_harness.py asserts no single line of either file contains it.
+# Our own block reason, split across source lines to keep it distinct from
+# source diagnostics. Only actual hook feedback records count as a past nudge;
+# a user quoting it or a tool reading it must not suppress an untested edit.
 NUDGE_MARKER = ("Harness check: source files were modified but no tests ran "
                 "afterward.")
 
@@ -96,6 +90,28 @@ def walk_tool_uses(obj):
     elif isinstance(obj, list):
         for v in obj:
             yield from walk_tool_uses(v)
+
+
+def is_nudge_record(rec):
+    """Recognize the two hook feedback records Claude Code writes."""
+    if not isinstance(rec, dict):
+        return False
+    message = rec.get("message") or {}
+    if (rec.get("type") == "user" and rec.get("isMeta") is True
+            and isinstance(message, dict)):
+        content = message.get("content")
+        if (isinstance(content, str)
+                and content.startswith("Stop hook feedback:\n" + NUDGE_MARKER)):
+            return True
+    attachment = rec.get("attachment") or {}
+    if (rec.get("type") == "attachment" and isinstance(attachment, dict)
+            and attachment.get("type") == "hook_blocking_error"
+            and attachment.get("hookEvent") == "Stop"):
+        error = attachment.get("blockingError") or {}
+        if isinstance(error, dict):
+            reason = error.get("blockingError")
+            return isinstance(reason, str) and reason.startswith(NUDGE_MARKER)
+    return False
 
 
 def detect_test_cmd(cwd):
@@ -172,18 +188,12 @@ def main():
                 line = line.strip()
                 if not line:
                     continue
-                # Our own past nudge: a plain meta user message plus the
-                # hook_blocking_error attachment Claude Code records beside it.
-                # Matched on the raw line so it costs nothing on the hot path.
-                if NUDGE_MARKER in line:
-                    last_nudge = idx
-                    # deliberately NOT `continue`: a line can carry both the
-                    # marker and a tool_use (an agent grepping for it, say), and
-                    # skipping the walk would lose that edit or test run.
                 try:
                     rec = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     continue
+                if is_nudge_record(rec):
+                    last_nudge = idx
                 for name, inp in walk_tool_uses(rec):
                     if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
                         path = (inp.get("file_path") or inp.get("notebook_path")
